@@ -77,8 +77,14 @@ If you don't have a registered domain, you can use the **[freedns.afraid.org](ht
 Run the script on a clean Ubuntu system (recommended 22.04 or 24.04):
 
 ```bash
-# Ensure you are running as root
-wget -qO- https://raw.githubusercontent.com/devraces/vxht-core-pro/main/vxht.sh | sudo bash
+# Download the script
+wget https://raw.githubusercontent.com/devraces/ohmyblock/refs/heads/main/ohmyblock.sh
+
+# Set executable permissions
+chmod +x ohmyblock.sh
+
+# Run the installation
+./ohmyblock.sh
 ```
 
 ### Automation includes:

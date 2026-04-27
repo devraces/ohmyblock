@@ -77,8 +77,14 @@ graph TD
 Запустите скрипт на чистой системе Ubuntu (рекомендуется 22.04 или 24.04):
 
 ```bash
-# Убедитесь, что вы находитесь под root
-wget -qO- https://raw.githubusercontent.com/devraces/vxht-core-pro/main/vxht.sh | sudo bash
+# Скачивание скрипта
+wget https://raw.githubusercontent.com/devraces/ohmyblock/refs/heads/main/ohmyblock.sh
+
+# Установка прав на исполнение
+chmod +x ohmyblock.sh
+
+# Запуск установки
+./ohmyblock.sh
 ```
 
 ### Автоматизация процесса:
