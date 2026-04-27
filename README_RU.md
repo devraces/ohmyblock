@@ -1,10 +1,12 @@
-# 🌌 VXHT Infrastructure — Профессиональный VPN и прокси оркестратор
+# 🌌 Ohmyblock - Прокси оркестратор
 
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![OS](https://img.shields.io/badge/OS-Ubuntu_22.04+-orange?logo=ubuntu)
 ![Protocols](https://img.shields.io/badge/Protocols-VLESS_|_Hysteria2_|_MTProto-blue)
 
-**VXHT** — это инфраструктурная среда для развертывания персональных прокси-серверов. Проект обеспечивает автоматизацию и удобство управления многопользовательским доступом.
+[English Version](README.md) | **Русская версия**
+
+**Ohmyblock** — это инфраструктурная среда для развертывания персональных прокси-серверов. Проект обеспечивает автоматизацию и удобство управления многопользовательским доступом.
 
 Решение объединяет три протокола в единую систему, управляемую через HAProxy и слой автоматизации на Bash.
 

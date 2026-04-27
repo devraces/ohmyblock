@@ -1,10 +1,12 @@
-# 🌌 VXHT Infrastructure — Professional VPN & Proxy Orchestrator
+# 🌌 Ohmyblock - Proxy Orchestrator
 
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![OS](https://img.shields.io/badge/OS-Ubuntu_22.04+-orange?logo=ubuntu)
 ![Protocols](https://img.shields.io/badge/Protocols-VLESS_|_Hysteria2_|_MTProto-blue)
 
-**VXHT** is an infrastructure environment for deploying personal proxy nodes. The project provides automation and streamlined multi-user access management.
+**English Version** | [Russian Version](README_RU.md)
+
+**Ohmyblock** is an infrastructure environment for deploying personal proxy nodes. The project provides automation and streamlined multi-user access management.
 
 This solution integrates three protocols into a unified system, managed via HAProxy and a Bash automation layer.
 
