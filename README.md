@@ -68,7 +68,6 @@ If you don't have a registered domain, you can use the **[freedns.afraid.org](ht
 2. Under **"Registry"**, choose any available public domain.
 3. Create your own subdomain (e.g., `myvpn.mooo.com`).
 4. Set the destination to your server's IP.
-5. Use this subdomain during the VXHT installation process.
 
 ---
 
