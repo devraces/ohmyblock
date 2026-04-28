@@ -19,7 +19,6 @@ set -Eeuo pipefail
 umask 077
 
 # Ловушка ERR: при любой ошибке в скрипте печатает номер строки в stderr.
-# Помогает быстро найти место сбоя без трейса всего стека.
 trap 'echo "Ошибка на строке $LINENO" >&2' ERR
 
 # ─── Цветовые коды ANSI для вывода в терминал ────────────────────────────────
@@ -27,92 +26,38 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'   # NC = No Color — сброс цвета
+NC='\033[0m'
 
-# ─── Вспомогательные функции вывода ──────────────────────────────────────────
-print_status()  { echo -e "${GREEN}[✓]${NC} $1"; }   # Успех
-print_error()   { echo -e "${RED}[✗]${NC} $1"; }     # Ошибка
-print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }  # Предупреждение
-print_info()    { echo -e "${BLUE}[i]${NC} $1"; }    # Информация
+print_status()  { echo -e "${GREEN}[✓]${NC} $1"; }
+print_error()   { echo -e "${RED}[✗]${NC} $1"; }
+print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
+print_info()    { echo -e "${BLUE}[i]${NC} $1"; }
 
 # ─── normalize_host ───────────────────────────────────────────────────────────
 # Приводит введённый пользователем хост к единому виду:
-#   1. Убирает пробелы (на случай случайного ввода)
+#   1. Убирает пробелы
 #   2. Срезает префиксы http:// и https://
 #   3. Срезает завершающий слэш
 #   4. Приводит к нижнему регистру
-# Пример: "  HTTPS://GitHub.Com/  " → "github.com"
 normalize_host() {
   local h="${1:-}"
-  h="${h//[[:space:]]/}"          # удалить все пробелы
-  h="${h#http://}"                # убрать http://
-  h="${h#https://}"               # убрать https://
-  h="${h%/}"                      # убрать trailing слэш
-  printf '%s' "$h" | tr '[:upper:]' '[:lower:]'   # → нижний регистр
+  h="${h//[[:space:]]/}"
+  h="${h#http://}"
+  h="${h#https://}"
+  h="${h%/}"
+  printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
 }
 
 # ─── valid_port ───────────────────────────────────────────────────────────────
 # Проверяет, что переданная строка — корректный номер порта (1–65535).
-# Используется для валидации пользовательского ввода портов.
-# Возвращает 0 (true) если порт валиден, иначе 1 (false).
+# 10#$1 — принудительный перевод в десятичную, защита от "08" → восьмеричное.
 valid_port() {
   [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 ))
-  # 10#$1 — принудительный перевод в десятичную систему,
-  # защита от интерпретации "08" как восьмеричного числа в bash.
-}
-
-# ─── get_server_ip ────────────────────────────────────────────────────────────
-# Определяет внешний IPv4-адрес сервера тремя способами (fallback-цепочка):
-#   1. icanhazip.com   — быстрый, возвращает чистый IP
-#   2. ifconfig.me     — резервный внешний сервис
-#   3. hostname -I     — локальный способ (работает без интернета,
-#                        но может вернуть приватный адрес в NAT-окружении)
-# IP нужен для формирования ссылок подключения, если пользователь
-# не задал публичный хост вручную.
-get_server_ip() {
-  local ip=""
-  ip="$(curl -4 -fsS https://icanhazip.com 2>/dev/null || true)"
-  ip="${ip//$'\n'/}"               # убираем переводы строк из ответа
-  if [[ -z "$ip" ]]; then
-    ip="$(curl -4 -fsS https://ifconfig.me 2>/dev/null || true)"
-    ip="${ip//$'\n'/}"
-  fi
-  if [[ -z "$ip" ]]; then
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-  fi
-  printf '%s' "$ip"
-}
-
-# ─── gen_alnum_pass ───────────────────────────────────────────────────────────
-# Генерирует случайный 16-символьный пароль из алфавитно-цифровых символов
-# (A-Za-z0-9). Цикл гарантирует ровно 16 символов: openssl base64 иногда
-# выдаёт меньше после tr -dc, поэтому пробуем до успеха.
-# Используется для паролей Hysteria2-пользователей.
-gen_alnum_pass() {
-  local p=""
-  while :; do
-    p="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)"
-    if [[ ${#p} -eq 16 ]]; then
-      printf '%s' "$p"
-      return 0
-    fi
-  done
-}
-
-# ─── gen_hex_secret ───────────────────────────────────────────────────────────
-# Генерирует 32-символьный hex-секрет (128 бит случайных данных).
-# Используется для MTProto-секретов Telemt-пользователей.
-gen_hex_secret() {
-  openssl rand -hex 16
 }
 
 # ─── find_cert_name_for_domain ────────────────────────────────────────────────
 # Ищет в базе certbot имя сертификата, который покрывает указанный домен.
-# Certbot хранит сертификаты под именами, которые могут отличаться от домена
-# (например, если сертификат на несколько доменов).
-# Вывод: имя сертификата (Certificate Name) или пустая строка.
-# Используется, чтобы переиспользовать уже выпущенный сертификат
-# вместо повторного запроса.
+# Используется, чтобы переиспользовать уже выпущенный сертификат.
 find_cert_name_for_domain() {
   local domain="$1"
   certbot certificates 2>/dev/null | awk -v target="$domain" '
@@ -130,121 +75,103 @@ find_cert_name_for_domain() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ПРОВЕРКА ПРАВ: скрипт должен запускаться от root.
-# EUID — эффективный UID текущего процесса; fallback через id -u
-# если EUID по каким-то причинам не задана.
 # ─────────────────────────────────────────────────────────────────────────────
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   print_error "Скрипт должен запускаться от root"
   exit 1
 fi
 
-# ─── Шапка ───────────────────────────────────────────────────────────────────
 echo ""
 echo "============================================"
-echo "   VLESS + Hysteria2 + Telemt  by.Alexdev   " 
+echo "   VLESS + Hysteria2 + Telemt  by.Alexdev   "
 echo "============================================"
 echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # БЛОК ИНТЕРАКТИВНОГО ВВОДА ПАРАМЕТРОВ
-# Все переменные имеют дефолтные значения — пользователь может просто
-# нажимать Enter для каждого поля.
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Параметры"
 echo ""
 
-# Порт HAProxy — точка входа для всего TCP-трафика (TLS SNI роутинг).
-# Стандартный 443 позволяет работать без нестандартных портов на клиенте.
 read -rp "Порт HAProxy [443]: " HAPROXY_PORT
 HAPROXY_PORT=${HAPROXY_PORT:-443}
 valid_port "$HAPROXY_PORT" || { print_error "Неверный HAProxy порт"; exit 1; }
 
-# Порт Xray — принимает VLESS xHTTP + Reality от HAProxy.
-# Слушает только на localhost, снаружи недоступен.
 read -rp "Порт Xray/VLESS [8443]: " XRAY_PORT
 XRAY_PORT=${XRAY_PORT:-8443}
 valid_port "$XRAY_PORT" || { print_error "Неверный Xray порт"; exit 1; }
 
-# Порт Telemt — принимает MTProto от HAProxy.
-# Тоже только localhost.
 read -rp "Порт Telemt [9443]: " TELEMT_PORT
 TELEMT_PORT=${TELEMT_PORT:-9443}
 valid_port "$TELEMT_PORT" || { print_error "Неверный Telemt порт"; exit 1; }
 
-# SNI для VLESS Reality — домен, под который маскируется Xray.
-# HAProxy роутит на Xray, когда TLS ClientHello содержит этот SNI.
-# Reality имитирует handshake с этим доменом, поэтому трафик
-# визуально неотличим от реального TLS-соединения с github.com.
 read -rp "SNI для VLESS Reality [github.com]: " XRAY_SNI
 XRAY_SNI=${XRAY_SNI:-github.com}
 XRAY_SNI="$(normalize_host "$XRAY_SNI")"
+# Базовый домен без префикса www. — серверным SNI Xray будет
+# одновременно "$XRAY_SNI" и "www.$XRAY_SNI"; защита от "www.www.…".
+XRAY_SNI="${XRAY_SNI#www.}"
 
-# TLS домен для Telemt — MTProto TLS использует этот домен для FakeTLS.
-# Должен отличаться от XRAY_SNI, иначе HAProxy не сможет разделить трафик.
 read -rp "TLS домен для Telemt [www.google.com]: " TELEMT_TLS_DOMAIN
 TELEMT_TLS_DOMAIN=${TELEMT_TLS_DOMAIN:-www.google.com}
 TELEMT_TLS_DOMAIN="$(normalize_host "$TELEMT_TLS_DOMAIN")"
 
-# Домен для Hysteria2 — реальный домен, на который выпускается сертификат
-# Let's Encrypt. Hysteria2 слушает UDP 443, отдельно от HAProxy (TCP 443).
-# Для выпуска сертификата сервер должен быть доступен по этому домену на порту 80.
 read -rp "Домен для Hysteria2 (для заглушки и TLS): " HY2_DOMAIN
 HY2_DOMAIN="$(normalize_host "$HY2_DOMAIN")"
 
-# Email для Let's Encrypt — используется для уведомлений об истечении сертификата.
 read -rp "Email для Let's Encrypt: " HY2_EMAIL
 
-# Имя первого пользователя — создаётся автоматически с UUID, паролем Hy2
-# и MTProto-секретом. После установки можно добавлять других через newuser.
 read -rp "Первый пользователь [main]: " FIRST_USER
 FIRST_USER=${FIRST_USER:-main}
 
-# ─── Определение внешнего IP сервера ─────────────────────────────────────────
-SERVER_IP="$(get_server_ip)"
+# Внешний IP сервера (fallback-цепочка из трёх методов).
+# Используется и здесь, и в lib (см. server_ip()).
+detect_server_ip() {
+  local ip=""
+  ip="$(curl -4 -fsS https://icanhazip.com 2>/dev/null || true)"
+  ip="${ip//$'\n'/}"
+  if [[ -z "$ip" ]]; then
+    ip="$(curl -4 -fsS https://ifconfig.me 2>/dev/null || true)"
+    ip="${ip//$'\n'/}"
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  printf '%s' "$ip"
+}
+SERVER_IP="$(detect_server_ip)"
 if [[ -z "$SERVER_IP" ]]; then
   print_error "Не удалось определить внешний IP сервера"
   exit 1
 fi
 
-# Публичный хост — IP или домен, который будет вставлен в ссылки подключения.
-# По умолчанию — определённый выше внешний IP.
-# Если сервер за реверс-прокси или CDN — можно указать домен вручную.
 read -rp "Публичный хост для ссылок [${SERVER_IP}]: " PUBLIC_HOST
 PUBLIC_HOST=${PUBLIC_HOST:-$SERVER_IP}
 PUBLIC_HOST="$(normalize_host "$PUBLIC_HOST")"
-if [[ -z "$PUBLIC_HOST" ]]; then
-  PUBLIC_HOST="$SERVER_IP"
-fi
+[[ -z "$PUBLIC_HOST" ]] && PUBLIC_HOST="$SERVER_IP"
 
-# ─── Финальная валидация входных данных ──────────────────────────────────────
-
-# Все обязательные поля должны быть заполнены.
+# ─── Финальная валидация ──────────────────────────────────────────────────────
 if [[ -z "$XRAY_SNI" || -z "$TELEMT_TLS_DOMAIN" || -z "$HY2_DOMAIN" || -z "$HY2_EMAIL" ]]; then
   print_error "Не все параметры заданы"
   exit 1
 fi
 
-# Имя пользователя: только безопасные символы (буквы, цифры, точка, тире, подчёркивание).
-# Запрет спецсимволов защищает от инъекций в конфиги TOML/JSON/YAML.
 if ! [[ "$FIRST_USER" =~ ^[A-Za-z0-9._-]+$ ]]; then
   print_error "Имя пользователя должно содержать только A-Za-z0-9._-"
   exit 1
 fi
 
-# HAProxy роутит трафик по SNI, поэтому все три SNI/домена должны быть уникальны.
 if [[ "$XRAY_SNI" == "$TELEMT_TLS_DOMAIN" ]]; then
   print_error "SNI для Xray и Telemt должны быть разными"
   exit 1
 fi
 
-# Hysteria2-домен — реальный домен с DNS-записью; он не может совпадать
-# с маскировочными SNI Xray/Telemt, которые просто имитируются.
 if [[ "$HY2_DOMAIN" == "$XRAY_SNI" || "$HY2_DOMAIN" == "$TELEMT_TLS_DOMAIN" ]]; then
   print_error "Домен Hysteria2 должен быть отдельным, не совпадать с Xray/Telemt SNI"
   exit 1
 fi
 
-# ─── Предпросмотр конфигурации перед установкой ───────────────────────────────
+# ─── Предпросмотр ────────────────────────────────────────────────────────────
 echo ""
 print_info "Конфигурация:"
 echo "  HAProxy:     0.0.0.0:${HAPROXY_PORT}"
@@ -257,8 +184,6 @@ echo "  Public host: ${PUBLIC_HOST}"
 echo "  First user:   ${FIRST_USER}"
 echo ""
 
-# Финальное подтверждение — даём пользователю шанс прервать перед
-# деструктивными операциями (перезапись конфигов, установка пакетов).
 read -rp "Продолжить установку? (y/n): " CONFIRM
 if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
   print_warning "Установка отменена"
@@ -269,158 +194,56 @@ fi
 # УСТАНОВКА СИСТЕМНЫХ ПАКЕТОВ
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Обновление и пакеты..."
+export DEBIAN_FRONTEND=noninteractive
 apt update
 apt install -y qrencode curl jq haproxy wget openssl tar certbot ufw ca-certificates kmod python3
-# qrencode    — генерация QR-кодов прямо в терминале (ANSI art)
-# jq          — парсинг и редактирование JSON (база данных пользователей)
-# haproxy     — входной TCP-балансировщик с SNI-роутингом
-# certbot     — выпуск TLS-сертификатов Let's Encrypt для Hysteria2
-# ufw         — управление firewall (iptables frontend)
-# kmod        — утилиты для загрузки модулей ядра (нужно для BBR)
-# python3     — требуется некоторыми вспомогательными скриптами certbot
 print_status "Пакеты установлены"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ВКЛЮЧЕНИЕ BBR (TCP Bottleneck Bandwidth and RTT)
-# BBR — алгоритм управления перегрузкой от Google, значительно улучшает
-# пропускную способность и снижает задержки, особенно полезен для прокси.
-# fq (Fair Queueing) — планировщик очереди, который BBR требует в паре.
+# ВКЛЮЧЕНИЕ BBR
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "BBR..."
 if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
   print_status "BBR уже включен"
 else
-  modprobe tcp_bbr 2>/dev/null || true   # загружаем модуль ядра BBR
+  modprobe tcp_bbr 2>/dev/null || true
   grep -q '^net.core.default_qdisc=fq$' /etc/sysctl.conf || echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
   grep -q '^net.ipv4.tcp_congestion_control=bbr$' /etc/sysctl.conf || echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
-  sysctl -p >/dev/null 2>&1 || true      # применяем параметры ядра
+  sysctl -p >/dev/null 2>&1 || true
   print_status "BBR включен"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
-# СОЗДАНИЕ ДИРЕКТОРИЙ И РЕЗЕРВНЫХ КОПИЙ
-# Все рабочие директории создаются заранее с нужными правами.
-# Перед перезаписью ключевых файлов делаем timestamped-бэкапы.
+# ДИРЕКТОРИИ И БЭКАПЫ
 # ─────────────────────────────────────────────────────────────────────────────
 mkdir -p /usr/local/etc/xray /usr/local/etc/proxy /etc/telemt /etc/hysteria /etc/hysteria/certs /opt/telemt /var/www/masq /usr/local/lib
-chmod 755 /usr/local /usr/local/etc /usr/local/etc/xray /usr/local/etc/proxy 2>/dev/null || true
+chmod 755 /usr/local /usr/local/etc 2>/dev/null || true
 chmod 755 /usr/local/etc/xray /usr/local/etc/proxy /etc/telemt /etc/hysteria /etc/hysteria/certs
 
-# Пути к основным хранилищам данных.
-KEYS="/usr/local/etc/xray/.keys"         # ключи и параметры установки (flat key:value)
-USERS_DB="/usr/local/etc/proxy/users.json"  # база пользователей (JSON)
+KEYS="/usr/local/etc/xray/.keys"
+USERS_DB="/usr/local/etc/proxy/users.json"
 
-# Резервные копии с меткой времени — на случай повторного запуска скрипта.
-[ -f "$KEYS" ] && cp "$KEYS" "$KEYS.bak.$(date +%F_%H%M%S)" || true
-[ -f "$USERS_DB" ] && cp "$USERS_DB" "$USERS_DB.bak.$(date +%F_%H%M%S)" || true
-
-# ─────────────────────────────────────────────────────────────────────────────
-# УСТАНОВКА XRAY И ГЕНЕРАЦИЯ КРИПТОГРАФИЧЕСКИХ КЛЮЧЕЙ
-# ─────────────────────────────────────────────────────────────────────────────
-print_info "Установка Xray..."
-
-# Официальный установщик от XTLS — скачивает и устанавливает последнюю версию.
-bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null 2>&1
-
-# UUID — уникальный идентификатор клиента в VLESS-протоколе.
-# Каждый пользователь получает свой UUID.
-UUID="$(xray uuid)"
-
-# Ключевая пара X25519 для Reality:
-# - приватный ключ хранится на сервере (никому не передаётся)
-# - публичный ключ вставляется в ссылку подключения для клиента
-# Reality использует эту пару для создания маскировочного TLS-рукопожатия.
-X25519_OUT="$(xray x25519 2>&1 | tr -d '\r')"
-
-# Парсим вывод xray x25519 — формат может варьироваться между версиями,
-# поэтому обрабатываем несколько возможных вариантов заголовков.
-PRIVATE_KEY="$(
-  awk -F': ' '
-    /^Private[[:space:]]*Key:/ {print $2; exit}
-    /^PrivateKey:/ {print $2; exit}
-  ' <<< "$X25519_OUT"
-)"
-
-PUBLIC_KEY="$(
-  awk -F': ' '
-    /^Public[[:space:]]*Key:/ {print $2; exit}
-    /^PublicKey:/ {print $2; exit}
-    /^Password \(PublicKey\):/ {print $2; exit}
-  ' <<< "$X25519_OUT"
-)"
-
-# Если ключи не распарсились — аварийный выход с диагностикой.
-if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-  echo "Не удалось получить ключи x25519"
-  echo "Сырой вывод:"
-  echo "$X25519_OUT"
-  exit 1
-fi
-
-# Short ID — дополнительный 8-байтный идентификатор Reality-сессии.
-# Используется для дополнительной аутентификации и фингерпринтинга.
-SHORT_ID="$(openssl rand -hex 8)"
-
-# Генерируем учётные данные первого пользователя:
-# - пароль Hysteria2 (буквенно-цифровой, 16 символов)
-# - MTProto-секрет для Telemt (hex, 32 символа)
-MAIN_HY2_PASS="$(gen_alnum_pass)"
-MAIN_TEL_SECRET="$(gen_hex_secret)"
-
-# ─── Сохраняем параметры установки в .keys ────────────────────────────────────
-# Плоский формат key: value удобен для парсинга через awk (функция kv()).
-# Файл хранится с правами 600 — только root.
-cat > "$KEYS" <<EOF
-public_host: $PUBLIC_HOST
-server_ip: $SERVER_IP
-haproxy_port: $HAPROXY_PORT
-xray_port: $XRAY_PORT
-telemt_port: $TELEMT_PORT
-xray_sni: $XRAY_SNI
-telemt_tls_domain: $TELEMT_TLS_DOMAIN
-hy2_domain: $HY2_DOMAIN
-hy2_email: $HY2_EMAIL
-hy2_cert_name: $HY2_DOMAIN
-hysteria_service: hysteria-server.service
-xray_uuid: $UUID
-xray_private_key: $PRIVATE_KEY
-xray_public_key: $PUBLIC_KEY
-xray_short_id: $SHORT_ID
-EOF
-chmod 600 "$KEYS"
-
-# ─── Инициализация базы данных пользователей ─────────────────────────────────
-# JSON-файл со списком пользователей. Каждый пользователь содержит:
-#   name      — уникальное имя
-#   uuid      — VLESS-идентификатор для Xray
-#   hy2pass   — пароль Hysteria2
-#   telsecret — MTProto-секрет для Telemt (raw hex, без префикса ee)
-cat > "$USERS_DB" <<EOF
-{
-  "users": [
-    {
-      "name": "$FIRST_USER",
-      "uuid": "$UUID",
-      "hy2pass": "$MAIN_HY2_PASS",
-      "telsecret": "$MAIN_TEL_SECRET"
-    }
-  ]
+backup_file() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    cp "$f" "$f.bak.$(date +%F_%H%M%S)" || true
+  fi
 }
-EOF
-chmod 600 "$USERS_DB"
+backup_file "$KEYS"
+backup_file "$USERS_DB"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ОБЩАЯ БИБЛИОТЕКА /usr/local/lib/proxy-common.sh
 #
-# Выносим весь переиспользуемый код в отдельный файл-библиотеку.
-# Все управляющие команды (newuser, rmuser, sharelink и др.) подключают её
-# через `source`. Это исключает дублирование кода и упрощает поддержку.
+# Единственный источник переиспользуемых функций. Записываем её ДО установки
+# Xray, чтобы можно было сразу `source` и пользоваться gen_alnum_pass / etc
+# в основном скрипте — без дублирования кода.
 # ─────────────────────────────────────────────────────────────────────────────
 cat > /usr/local/lib/proxy-common.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─── Пути к хранилищам данных ────────────────────────────────────────────────
+# ─── Пути ────────────────────────────────────────────────────────────────────
 KEYS="/usr/local/etc/xray/.keys"
 USERS_DB="/usr/local/etc/proxy/users.json"
 XRAY_CFG="/usr/local/etc/xray/config.json"
@@ -429,16 +252,12 @@ HY2_CFG="/etc/hysteria/config.yaml"
 
 # ─── kv <key> ─────────────────────────────────────────────────────────────────
 # Читает значение по ключу из файла .keys (формат "key: value").
-# Аналог ini-парсера для плоского key:value файла.
-# Пример: kv xray_port → "8443"
 kv() {
   awk -F': ' -v k="$1" '$1==k {print $2; exit}' "$KEYS" 2>/dev/null
 }
 
-# ─── Генераторы паролей (дублируются из основного скрипта) ───────────────────
-# Необходимы в библиотеке, так как newuser создаёт учётные данные
-# без вызова основного скрипта установки.
-
+# ─── Генераторы ──────────────────────────────────────────────────────────────
+# gen_alnum_pass: 16 символов A-Za-z0-9 (для Hysteria2-паролей).
 gen_alnum_pass() {
   local p=""
   while :; do
@@ -450,76 +269,12 @@ gen_alnum_pass() {
   done
 }
 
+# gen_hex_secret: 32 hex (16 байт) для MTProto-секрета Telemt.
 gen_hex_secret() {
   openssl rand -hex 16
 }
 
-# ─── Функции работы с базой пользователей (users.json) ───────────────────────
-
-# Количество пользователей в БД.
-db_user_count() {
-  jq '.users | length' "$USERS_DB" 2>/dev/null || echo 0
-}
-
-# Имя первого пользователя (для команд mainuser, tglink, hy2info).
-db_first_user() {
-  jq -r '.users[0].name // empty' "$USERS_DB" 2>/dev/null
-}
-
-# Список всех имён пользователей (по одному на строку).
-db_user_names() {
-  jq -r '.users[].name' "$USERS_DB" 2>/dev/null
-}
-
-# Проверка существования пользователя по имени.
-# Возвращает 0 если существует, 1 если нет.
-db_has_user() {
-  local name="$1"
-  jq -e --arg n "$name" '.users[]? | select(.name==$n)' "$USERS_DB" >/dev/null 2>&1
-}
-
-# Получение значения конкретного поля пользователя.
-# Пример: db_get_user_field "alice" "hy2pass" → "Xk9pQr2mNv7aLb4w"
-db_get_user_field() {
-  local name="$1"
-  local field="$2"
-  jq -r --arg n "$name" --arg f "$field" '.users[] | select(.name==$n) | .[$f] // empty' "$USERS_DB" 2>/dev/null | head -n1
-}
-
-# Добавление нового пользователя в БД.
-# Использует mktemp для атомарной записи — исключает повреждение файла
-# при прерывании записи (write-then-move идиома).
-db_add_user() {
-  local name="$1"
-  local uuid="$2"
-  local hy2pass="$3"
-  local telsecret="$4"
-  local tmp
-  tmp="$(mktemp)"
-  jq --arg name "$name" \
-     --arg uuid "$uuid" \
-     --arg hy2pass "$hy2pass" \
-     --arg telsecret "$telsecret" \
-     '.users += [{"name":$name,"uuid":$uuid,"hy2pass":$hy2pass,"telsecret":$telsecret}]' \
-     "$USERS_DB" > "$tmp"
-  mv "$tmp" "$USERS_DB"
-  chmod 600 "$USERS_DB"
-}
-
-# Удаление пользователя из БД по имени.
-# Тоже через mktemp для атомарности.
-db_remove_user() {
-  local name="$1"
-  local tmp
-  tmp="$(mktemp)"
-  jq --arg name "$name" '.users |= map(select(.name != $name))' "$USERS_DB" > "$tmp"
-  mv "$tmp" "$USERS_DB"
-  chmod 600 "$USERS_DB"
-}
-
-# ─── Вспомогательные функции для получения сетевых параметров ────────────────
-
-# Внешний IP сервера (fallback-цепочка из трёх методов).
+# ─── Сетевые параметры ───────────────────────────────────────────────────────
 server_ip() {
   local ip=""
   ip="$(curl -4 -fsS https://icanhazip.com 2>/dev/null || true)"
@@ -534,7 +289,6 @@ server_ip() {
   printf '%s' "$ip"
 }
 
-# Публичный хост из .keys, или внешний IP как fallback.
 public_host() {
   local h
   h="$(kv public_host)"
@@ -542,7 +296,6 @@ public_host() {
   printf '%s' "$h"
 }
 
-# Порт HAProxy из .keys, или 443 как fallback.
 public_port() {
   local p
   p="$(kv haproxy_port)"
@@ -550,20 +303,102 @@ public_port() {
   printf '%s' "$p"
 }
 
-# Домен Hysteria2 из .keys.
 hy2_domain() {
   kv hy2_domain
 }
 
-# ─── tg_full_secret_for <user> ────────────────────────────────────────────────
-# Формирует полный MTProto TLS-секрет для Telegram-ссылки.
-#
-# Формат секрета MTProto TLS:
-#   ee + <hex-секрет пользователя> + <hex-кодированный TLS домен>
-#
-# Префикс "ee" — маркер TLS-режима MTProto (FakeTLS).
-# Домен кодируется как hex с помощью od (octal dump с -tx1 флагом).
-# Результат вставляется в ссылку t.me/proxy?secret=...
+# ─── База пользователей ──────────────────────────────────────────────────────
+db_user_count() {
+  jq '.users | length' "$USERS_DB" 2>/dev/null || echo 0
+}
+
+db_first_user() {
+  jq -r '.users[0].name // empty' "$USERS_DB" 2>/dev/null
+}
+
+db_user_names() {
+  jq -r '.users[].name' "$USERS_DB" 2>/dev/null
+}
+
+db_has_user() {
+  local name="$1"
+  jq -e --arg n "$name" '.users[]? | select(.name==$n)' "$USERS_DB" >/dev/null 2>&1
+}
+
+db_get_user_field() {
+  local name="$1"
+  local field="$2"
+  jq -r --arg n "$name" --arg f "$field" '.users[] | select(.name==$n) | .[$f] // empty' "$USERS_DB" 2>/dev/null | head -n1
+}
+
+# Атомарная запись через mktemp+mv.
+db_add_user() {
+  local name="$1" uuid="$2" hy2pass="$3" telsecret="$4"
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg name "$name" --arg uuid "$uuid" \
+     --arg hy2pass "$hy2pass" --arg telsecret "$telsecret" \
+     '.users += [{"name":$name,"uuid":$uuid,"hy2pass":$hy2pass,"telsecret":$telsecret}]' \
+     "$USERS_DB" > "$tmp"
+  mv "$tmp" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+}
+
+db_remove_user() {
+  local name="$1"
+  local tmp
+  tmp="$(mktemp)"
+  jq --arg name "$name" '.users |= map(select(.name != $name))' "$USERS_DB" > "$tmp"
+  mv "$tmp" "$USERS_DB"
+  chmod 600 "$USERS_DB"
+}
+
+# ─── Высокоуровневые хелперы для команд /usr/local/bin/* ─────────────────────
+
+# require_first_user: печатает имя первого пользователя, иначе exit 1.
+require_first_user() {
+  local u
+  u="$(db_first_user)"
+  if [[ -z "$u" ]]; then
+    echo "Нет пользователей" >&2
+    exit 1
+  fi
+  printf '%s' "$u"
+}
+
+# db_print_users_indexed: загружает пользователей в массив USERS_ARR
+# и печатает пронумерованный список. Если список пуст — exit 1.
+# Использует глобальный массив USERS_ARR, чтобы вызывающий мог его потом читать.
+db_print_users_indexed() {
+  mapfile -t USERS_ARR < <(db_user_names)
+  if [[ ${#USERS_ARR[@]} -eq 0 ]]; then
+    echo "${1:-Список пользователей пуст}" >&2
+    exit 1
+  fi
+  echo "Пользователи:"
+  local i
+  for i in "${!USERS_ARR[@]}"; do
+    echo "$((i+1)). ${USERS_ARR[$i]}"
+  done
+}
+
+# db_pick_user <prompt>: интерактивный выбор пользователя из USERS_ARR.
+# Перед вызовом обычно идёт db_print_users_indexed.
+# Печатает выбранное имя или exit 1 при ошибочном вводе.
+db_pick_user() {
+  local prompt="${1:-Выберите пользователя}"
+  local choice
+  read -rp "${prompt}: " choice
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#USERS_ARR[@]} )); then
+    echo "Ошибка: номер от 1 до ${#USERS_ARR[@]}" >&2
+    exit 1
+  fi
+  printf '%s' "${USERS_ARR[$((choice-1))]}"
+}
+
+# ─── Формирование ссылок ─────────────────────────────────────────────────────
+
+# Полный MTProto TLS-секрет: ee + <hex секрет> + <hex домен>.
 tg_full_secret_for() {
   local user="$1"
   local raw domain_hex
@@ -572,40 +407,20 @@ tg_full_secret_for() {
   printf 'ee%s%s' "$raw" "$domain_hex"
 }
 
-# ─── xray_link_for <user> ─────────────────────────────────────────────────────
-# Формирует VLESS URI для подключения через Xray (Reality + xHTTP).
-#
-# Формат: vless://<uuid>@<host>:<port>?<параметры>#<имя>
-# Параметры:
-#   type=xhttp        — транспорт HTTP/2 или HTTP/3 (xhttp — расширенный HTTP)
-#   security=reality  — маскировочный TLS (не настоящий, но неотличимый снаружи)
-#   fp=firefox        — fingerprint TLS — имитируем Firefox
-#   pbk               — публичный ключ Reality (для клиентской проверки)
-#   sid               — short ID Reality-сессии
-#   sni               — домен маскировки (например, github.com)
-#   spx=/%2F          — URL-путь (закодированный слэш)
+# VLESS xHTTP + Reality URI.
 xray_link_for() {
   local user="$1"
-  local uuid pbk sid sni host port
+  local uuid pbk sid sni port
   uuid="$(db_get_user_field "$user" uuid)"
   pbk="$(kv xray_public_key)"
   sid="$(kv xray_short_id)"
   sni="$(kv xray_sni)"
-  host="$sni"
   port="$(public_port)"
   printf 'vless://%s@%s:%s?type=xhttp&security=reality&encryption=none&host=%s&path=%%2F&mode=auto&sni=%s&fp=firefox&pbk=%s&sid=%s&spx=%%2F#%s\n' \
-    "$uuid" "$(public_host)" "$port" "$host" "$sni" "$pbk" "$sid" "$user"
+    "$uuid" "$(public_host)" "$port" "$sni" "$sni" "$pbk" "$sid" "$user"
 }
 
-# ─── hy2_link_for <user> ──────────────────────────────────────────────────────
-# Формирует URI для подключения к Hysteria2.
-#
-# Формат: hy2://<user>:<pass>@<domain>:443?<параметры>#<имя>
-# Параметры:
-#   sni=<domain>       — SNI совпадает с реальным доменом сертификата LE
-#   alpn=h3            — QUIC/HTTP3 ALPN
-#   insecure=0         — проверяем сертификат (он настоящий, от LE!)
-#   allowInsecure=0    — дублирующий параметр для совместимости клиентов
+# Hysteria2 URI.
 hy2_link_for() {
   local user="$1"
   local pass domain
@@ -615,9 +430,7 @@ hy2_link_for() {
     "$user" "$pass" "$domain" "$domain" "$user"
 }
 
-# ─── Ссылки для Telegram MTProto ─────────────────────────────────────────────
-
-# HTTPS-ссылка для открытия в браузере (откроет Telegram через web).
+# Telegram MTProto ссылки в двух форматах.
 tg_https_link_for() {
   local user="$1"
   local full
@@ -625,7 +438,6 @@ tg_https_link_for() {
   printf 'https://t.me/proxy?server=%s&port=%s&secret=%s\n' "$(public_host)" "$(public_port)" "$full"
 }
 
-# tg://-схема для прямого открытия в приложении Telegram.
 tg_scheme_link_for() {
   local user="$1"
   local full
@@ -633,9 +445,7 @@ tg_scheme_link_for() {
   printf 'tg://proxy?server=%s&port=%s&secret=%s\n' "$(public_host)" "$(public_port)" "$full"
 }
 
-# ─── show_qr <string> ─────────────────────────────────────────────────────────
-# Генерирует QR-код прямо в терминале (ANSI Unicode art).
-# Полезно для сканирования мобильным клиентом без копирования строки.
+# QR в терминал.
 show_qr() {
   printf '%s\n' "$1" | qrencode -t ansiutf8
 }
@@ -643,25 +453,17 @@ show_qr() {
 # ─────────────────────────────────────────────────────────────────────────────
 # РЕНДЕРИНГ КОНФИГОВ
 # Все три функции перегенерируют конфиг "с нуля" из текущего состояния БД.
-# Это обеспечивает консистентность: после добавления/удаления пользователя
-# вызываем render_all_configs → все сервисы синхронизируются с БД.
+# Это гарантирует консистентность: после изменений в БД вызываем
+# render_all_configs → все сервисы синхронизируются.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ─── render_xray_config ───────────────────────────────────────────────────────
-# Генерирует /usr/local/etc/xray/config.json из шаблона.
-#
-# Ключевые особенности конфига Xray:
-#   - routing: блокируем рекламные домены и китайские IP (геолокация)
-#   - inbound: VLESS с xHTTP-транспортом + Reality-безопасностью
-#   - clients: список из всех пользователей в БД (uuid + email=name)
-#   - flow: пустая строка — XTLS-flow не используется с xhttp-транспортом
-#   - realitySettings: target — реальный сервер для маскировки,
-#     serverNames — допустимые SNI, privateKey — приватный ключ Reality
-#   - sniffing: определяем тип трафика для корректного routing
 render_xray_config() {
-  local clients_json
-  # Формируем JSON-массив клиентов из БД: [{email, id, flow}, ...]
+  local clients_json port sni pkey sid
   clients_json="$(jq -c '[.users[] | {email:.name,id:.uuid,flow:""}]' "$USERS_DB")"
+  port="$(kv xray_port)"
+  sni="$(kv xray_sni)"
+  pkey="$(kv xray_private_key)"
+  sid="$(kv xray_short_id)"
   cat > "$XRAY_CFG" <<EOF2
 {
   "log": {
@@ -685,10 +487,10 @@ render_xray_config() {
   "inbounds": [
     {
       "listen": "127.0.0.1",
-      "port": $(kv xray_port),
+      "port": ${port},
       "protocol": "vless",
       "settings": {
-        "clients": $clients_json,
+        "clients": ${clients_json},
         "decryption": "none"
       },
       "streamSettings": {
@@ -699,13 +501,13 @@ render_xray_config() {
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "target": "$(kv xray_sni):443",
-          "serverNames": ["$(kv xray_sni)", "www.$(kv xray_sni)"],
-          "privateKey": "$(kv xray_private_key)",
+          "target": "${sni}:443",
+          "serverNames": ["${sni}", "www.${sni}"],
+          "privateKey": "${pkey}",
           "minClientVer": "",
           "maxClientVer": "",
           "maxTimeDiff": 0,
-          "shortIds": ["$(kv xray_short_id)"]
+          "shortIds": ["${sid}"]
         }
       },
       "sniffing": {
@@ -732,92 +534,74 @@ EOF2
   chown root:root "$XRAY_CFG"
 }
 
-# ─── render_telemt_config ─────────────────────────────────────────────────────
-# Генерирует /etc/telemt/telemt.toml из параметров .keys и БД пользователей.
-#
-# Ключевые секции конфига Telemt:
-#   [general.modes]    — включаем только tls (FakeTLS), classic/secure off
-#   [general.links]    — публичный хост и порт для генерации ссылок
-#   [server]           — локальный порт и лимит соединений
-#   [server.api]       — REST API для управления (только localhost)
-#   [censorship]       — домен для TLS-маскировки
-#   [access.users]     — таблица "имя = hex-секрет" для аутентификации
 render_telemt_config() {
+  local pub_host hap_port tel_port tls_domain
+  pub_host="$(kv public_host)"
+  hap_port="$(kv haproxy_port)"
+  tel_port="$(kv telemt_port)"
+  tls_domain="$(kv telemt_tls_domain)"
   {
     echo "[general]"
-    echo "use_middle_proxy = false"   # не используем промежуточный прокси MTProto
+    echo "use_middle_proxy = false"
     echo "log_level = \"normal\""
     echo
     echo "[general.modes]"
-    echo "classic = false"    # классический MTProto без маскировки — off
-    echo "secure = false"     # DD MTProto секретный режим — off
-    echo "tls = true"         # FakeTLS режим — on (маскируется под TLS)
+    echo "classic = false"
+    echo "secure = false"
+    echo "tls = true"
     echo
     echo "[general.links]"
     echo "show = \"*\""
-    echo "public_host = \"$(kv public_host)\""
-    echo "public_port = $(kv haproxy_port)"
+    echo "public_host = \"${pub_host}\""
+    echo "public_port = ${hap_port}"
     echo
     echo "[server]"
-    echo "port = $(kv telemt_port)"
-    echo "listen_addr_ipv4 = \"127.0.0.1\""   # только localhost — снаружи через HAProxy
+    echo "port = ${tel_port}"
+    echo "listen_addr_ipv4 = \"127.0.0.1\""
     echo "max_connections = 10000"
     echo
     echo "[server.api]"
     echo "enabled = true"
     echo "listen = \"127.0.0.1:7443\""
-    echo "whitelist = [\"127.0.0.1/32\", \"::1/128\"]"   # API только с localhost
+    echo "whitelist = [\"127.0.0.1/32\", \"::1/128\"]"
     echo
     echo "[censorship]"
-    echo "tls_domain = \"$(kv telemt_tls_domain)\""   # домен FakeTLS маскировки
+    echo "tls_domain = \"${tls_domain}\""
     echo
     echo "[access.users]"
-    # Каждый пользователь: "имя" = "hex-секрет" (сырой, без ee-префикса)
     jq -r '.users[] | "\"" + .name + "\" = \"" + .telsecret + "\""' "$USERS_DB"
   } > "$TEL_CFG"
   chown telemt:telemt "$TEL_CFG"
   chmod 600 "$TEL_CFG"
 }
 
-# ─── render_hy2_config ────────────────────────────────────────────────────────
-# Генерирует /etc/hysteria/config.yaml для Hysteria2.
-#
-# Hysteria2 слушает UDP :443, использует сертификат от Let's Encrypt.
-# Аутентификация: userpass — словарь "имя: пароль".
-# Маскировочный HTTPS-сервер (masquerade) запускается на TCP :8444
-# и отдаёт статическую страницу-заглушку из /var/www/masq.
-# HAProxy роутит к нему TLS-трафик с HY2_DOMAIN через bk_hy2site.
 render_hy2_config() {
   local certname
   certname="$(kv hy2_cert_name)"
-  [[ -z "$certname" ]] && certname="$(kv hy2_domain)"   # fallback на hy2_domain
+  [[ -z "$certname" ]] && certname="$(kv hy2_domain)"
   {
     echo "listen: :443"
     echo
     echo "tls:"
-    # Пути к сертификатам Let's Encrypt. certname — имя сертификата в certbot,
-    # может отличаться от имени домена при wildcard или мультидоменных сертах.
     echo "  cert: /etc/letsencrypt/live/${certname}/fullchain.pem"
     echo "  key: /etc/letsencrypt/live/${certname}/privkey.pem"
     echo
     echo "auth:"
     echo "  type: userpass"
     echo "  userpass:"
-    # Генерируем словарь пользователей для Hysteria2
     jq -r '.users[] | "    \"" + .name + "\": \"" + .hy2pass + "\""' "$USERS_DB"
     echo
     echo "masquerade:"
     echo "  type: file"
-    echo "  listenHTTPS: :8444"   # HAProxy шлёт сюда TCP с SNI=hy2_domain
-    echo "  forceHTTPS: true"     # редиректим HTTP→HTTPS
+    echo "  listenHTTPS: :8444"
+    echo "  forceHTTPS: true"
     echo "  file:"
-    echo "    dir: /var/www/masq" # статическая заглушка-страница
+    echo "    dir: /var/www/masq"
   } > "$HY2_CFG"
   chown root:root "$HY2_CFG"
   chmod 600 "$HY2_CFG"
 }
 
-# Обёртка для перегенерации всех трёх конфигов за один вызов.
 render_all_configs() {
   render_xray_config
   render_telemt_config
@@ -825,7 +609,6 @@ render_all_configs() {
 }
 
 # Перезапуск всех динамических сервисов после изменений в БД пользователей.
-# Вызывается после newuser/rmuser.
 restart_dynamic_services() {
   systemctl restart xray
   systemctl restart telemt
@@ -833,10 +616,7 @@ restart_dynamic_services() {
 }
 
 # ─── print_bundle <user> ──────────────────────────────────────────────────────
-# Выводит все ссылки подключения для указанного пользователя:
-#   1. VLESS xHTTP + Reality ссылка + QR
-#   2. Hysteria2 ссылка + QR
-#   3. Telegram MTProto HTTPS и tg:// ссылки + QR
+# Все ссылки + QR-коды для одного пользователя.
 print_bundle() {
   local user="$1"
   local xlink hlink tlink tglink
@@ -873,50 +653,107 @@ print_bundle() {
 EOF
 chmod +x /usr/local/lib/proxy-common.sh
 
-# Загружаем библиотеку в текущий процесс установки и сразу генерируем конфиг.
+# Подключаем библиотеку — дальше пользуемся её хелперами без дублирования.
+# shellcheck source=/usr/local/lib/proxy-common.sh
 source /usr/local/lib/proxy-common.sh
-render_xray_config
 
-# Запускаем Xray и добавляем в автозагрузку.
+# ─────────────────────────────────────────────────────────────────────────────
+# УСТАНОВКА XRAY И ГЕНЕРАЦИЯ КЛЮЧЕЙ
+# ─────────────────────────────────────────────────────────────────────────────
+print_info "Установка Xray..."
+bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/var/log/xray-install.log 2>&1
+
+UUID="$(xray uuid)"
+
+# Парсим вывод xray x25519 — формат заголовков может варьироваться между версиями.
+X25519_OUT="$(xray x25519 2>&1 | tr -d '\r')"
+PRIVATE_KEY="$(
+  awk -F': ' '
+    /^Private[[:space:]]*Key:/ {print $2; exit}
+    /^PrivateKey:/ {print $2; exit}
+  ' <<< "$X25519_OUT"
+)"
+PUBLIC_KEY="$(
+  awk -F': ' '
+    /^Public[[:space:]]*Key:/ {print $2; exit}
+    /^PublicKey:/ {print $2; exit}
+    /^Password \(PublicKey\):/ {print $2; exit}
+  ' <<< "$X25519_OUT"
+)"
+
+if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
+  echo "Не удалось получить ключи x25519"
+  echo "Сырой вывод:"
+  echo "$X25519_OUT"
+  exit 1
+fi
+
+SHORT_ID="$(openssl rand -hex 8)"
+
+# Учётные данные первого пользователя.
+MAIN_HY2_PASS="$(gen_alnum_pass)"
+MAIN_TEL_SECRET="$(gen_hex_secret)"
+
+# ─── Сохраняем параметры установки в .keys ────────────────────────────────────
+cat > "$KEYS" <<EOF
+public_host: $PUBLIC_HOST
+server_ip: $SERVER_IP
+haproxy_port: $HAPROXY_PORT
+xray_port: $XRAY_PORT
+telemt_port: $TELEMT_PORT
+xray_sni: $XRAY_SNI
+telemt_tls_domain: $TELEMT_TLS_DOMAIN
+hy2_domain: $HY2_DOMAIN
+hy2_email: $HY2_EMAIL
+hy2_cert_name: $HY2_DOMAIN
+hysteria_service: hysteria-server.service
+xray_uuid: $UUID
+xray_private_key: $PRIVATE_KEY
+xray_public_key: $PUBLIC_KEY
+xray_short_id: $SHORT_ID
+EOF
+chmod 600 "$KEYS"
+
+# ─── Инициализация базы пользователей ─────────────────────────────────────────
+# Через jq -n — корректное JSON-экранирование на любых именах.
+jq -n --arg name "$FIRST_USER" --arg uuid "$UUID" \
+      --arg hy2pass "$MAIN_HY2_PASS" --arg telsecret "$MAIN_TEL_SECRET" \
+      '{users: [{name:$name, uuid:$uuid, hy2pass:$hy2pass, telsecret:$telsecret}]}' \
+      > "$USERS_DB"
+chmod 600 "$USERS_DB"
+
+# Генерируем Xray-конфиг и стартуем сервис.
+render_xray_config
 systemctl enable --now xray
 systemctl restart xray
 print_status "Xray установлен"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # УСТАНОВКА TELEMT (MTProto прокси для Telegram)
-# Telemt — форк mtproxy с поддержкой FakeTLS и TOML-конфигом.
-# Скачиваем готовый бинарник под текущую архитектуру и libc.
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Установка Telemt..."
 
-# Определяем архитектуру процессора для выбора правильного бинарника.
 ARCH="$(uname -m)"
 
-# Определяем используемую C-библиотеку:
-#   musl  — используется в Alpine Linux и других минималистичных дистрибутивах
-#   gnu   — стандартная glibc для Ubuntu/Debian/CentOS и большинства VPS
+# musl — Alpine и др. минималистичные дистрибутивы; gnu — стандартная glibc.
 if ldd --version 2>&1 | grep -iq musl; then
   LIBC="musl"
 else
   LIBC="gnu"
 fi
 
-# Формируем URL для скачивания: telemt-<arch>-linux-<libc>.tar.gz
 TELEMT_URL="https://github.com/telemt/telemt/releases/latest/download/telemt-${ARCH}-linux-${LIBC}.tar.gz"
-TMPDIR="$(mktemp -d)"  # временная директория, очищается после установки
+TMPDIR="$(mktemp -d)"
 
 print_info "Скачивание: telemt-${ARCH}-linux-${LIBC}.tar.gz"
 curl -fsSL -o "$TMPDIR/telemt.tar.gz" "$TELEMT_URL"
 tar -xzf "$TMPDIR/telemt.tar.gz" -C "$TMPDIR"
-# install -m 755 — копируем бинарник с установкой прав выполнения
 install -m 755 "$TMPDIR/telemt" /bin/telemt
-rm -rf "$TMPDIR"  # убираем временные файлы
+rm -rf "$TMPDIR"
 
-# Создаём системного пользователя telemt (без shell, без домашней директории).
-# Сервис запускается от непривилегированного пользователя для безопасности,
-# но с capability CAP_NET_BIND_SERVICE (не нужен здесь — слушает на >1024).
+# Системный пользователь telemt: nologin shell, домашняя директория /opt/telemt.
 if ! id telemt &>/dev/null; then
-  useradd -r -s /bin/false -d /opt/telemt -m telemt
+  useradd -r -s /usr/sbin/nologin -d /opt/telemt telemt
   print_status "Пользователь telemt создан"
 fi
 
@@ -938,10 +775,10 @@ WorkingDirectory=/opt/telemt
 ExecStart=/bin/telemt /etc/telemt/telemt.toml
 Restart=on-failure
 RestartSec=3
-LimitNOFILE=65536                              # увеличенный лимит файловых дескрипторов
+LimitNOFILE=65536
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true                           # запрет получения новых привилегий
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -955,18 +792,14 @@ print_status "Telemt настроен"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # УСТАНОВКА HYSTERIA2
-# Hysteria2 работает поверх QUIC (UDP), поэтому не конкурирует с HAProxy
-# на TCP. Занимает UDP :443. Для TCP-трафика с HY2_DOMAIN HAProxy
-# роутит к masquerade-серверу Hysteria2 (TCP :8444).
+# Hysteria2 работает поверх QUIC (UDP), не конкурирует с HAProxy на TCP.
+# Занимает UDP :443. Для TCP с HY2_DOMAIN HAProxy роутит к masquerade :8444.
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Установка Hysteria2"
 
 mkdir -p /var/www/masq /etc/hysteria/certs
 
 # ─── Страница-заглушка для маскировки ─────────────────────────────────────────
-# При обращении через браузер по HTTP/HTTPS пользователь увидит эту страницу
-# вместо ошибки соединения. Имитирует "что-то грузится" без явных признаков прокси.
-# Тёмный фон, три анимированные точки — стандартный loading screen.
 cat > /var/www/masq/index.html <<'HTML'
 <!DOCTYPE html>
 <html>
@@ -994,13 +827,11 @@ cat > /var/www/masq/index.html <<'HTML'
 </html>
 HTML
 
-# ─── Получение TLS-сертификата Let's Encrypt для Hysteria2 ───────────────────
-# Логика с тремя путями:
-#   1. Уже есть валидный сертификат точно для этого домена
-#   2. Есть сертификат под другим именем, покрывающий этот домен (мультидоменный)
-#   3. Нет сертификата → выпускаем через certbot standalone (временный HTTP-сервер)
-#
-# Для certbot standalone требуется свободный порт 80/tcp на время выпуска.
+# ─── Получение TLS-сертификата Let's Encrypt ─────────────────────────────────
+# Три пути:
+#   1. Уже есть валидный сертификат точно для $HY2_DOMAIN
+#   2. Есть сертификат под другим именем, покрывающий этот домен
+#   3. Нет сертификата → выпускаем через certbot standalone (требует свободный 80/tcp)
 if [[ -s "/etc/letsencrypt/live/$HY2_DOMAIN/fullchain.pem" && -s "/etc/letsencrypt/live/$HY2_DOMAIN/privkey.pem" ]]; then
   CERT_NAME="$HY2_DOMAIN"
   print_status "Найден существующий сертификат: $HY2_DOMAIN"
@@ -1016,31 +847,45 @@ else
     fi
 
     print_info "Получение сертификата Let's Encrypt для Hysteria2..."
+    # Все флаги одной командой, без inline-комментариев между \ —
+    # иначе перенос строк ломается.
     certbot certonly --standalone \
       --cert-name "$HY2_DOMAIN" \
-      --keep-until-expiring \     # не перевыпускать, если ещё действует
+      --keep-until-expiring \
       -d "$HY2_DOMAIN" \
       -m "$HY2_EMAIL" \
       --agree-tos \
-      --non-interactive            # без интерактивных вопросов
+      --non-interactive
 
     CERT_NAME="$HY2_DOMAIN"
   fi
 fi
 
-# Сохраняем итоговое имя сертификата в .keys для последующего использования.
-sed -i "s#^hy2_cert_name:.*#hy2_cert_name: $CERT_NAME#" "$KEYS" 2>/dev/null || echo "hy2_cert_name: $CERT_NAME" >> "$KEYS"
+# Атомарное обновление поля hy2_cert_name в .keys (надёжнее `sed -i`).
+update_keys_field() {
+  local key="$1" val="$2" tmp
+  tmp="$(mktemp)"
+  awk -v k="$key" -v v="$val" '
+    BEGIN { done = 0 }
+    $1 == k ":" || index($0, k ":") == 1 { print k ": " v; done = 1; next }
+    { print }
+    END { if (!done) print k ": " v }
+  ' "$KEYS" > "$tmp"
+  mv "$tmp" "$KEYS"
+  chmod 600 "$KEYS"
+}
+update_keys_field "hy2_cert_name" "$CERT_NAME"
 
-# Создаём системного пользователя для Hysteria2.
+# Системный пользователь для Hysteria2.
 if ! id hysteria &>/dev/null; then
   useradd -r -U -d /etc/hysteria -s /usr/sbin/nologin hysteria
 fi
 
-# Официальный установщик Hysteria2 от авторов.
+# Официальный установщик Hysteria2.
 print_info "Установка Hysteria2..."
-bash <(curl -fsSL https://get.hy2.sh/) >/dev/null 2>&1
+bash <(curl -fsSL https://get.hy2.sh/) >/var/log/hy2-install.log 2>&1
 
-# Ищем бинарник hysteria в стандартных местах.
+# Ищем бинарник hysteria.
 HYST_BIN="$(command -v hysteria || true)"
 if [[ -z "$HYST_BIN" ]]; then
   HYST_BIN="/usr/local/bin/hysteria"
@@ -1065,16 +910,14 @@ WorkingDirectory=/etc/hysteria
 ExecStart=$HYST_BIN server -c /etc/hysteria/config.yaml
 Restart=on-failure
 RestartSec=2
-LimitNOFILE=1048576   # максимальный лимит для высоконагруженного UDP-сервера
+LimitNOFILE=1048576
 NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# ─── Хук для автоматического перезапуска Hysteria2 после обновления сертификата ──
-# certbot при обновлении (renew) запускает скрипты из renewal-hooks/deploy/.
-# Hysteria2 нужно перезапустить, чтобы подхватить новый сертификат.
+# Хук для автоматического перезапуска Hysteria2 после обновления сертификата.
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 cat > /etc/letsencrypt/renewal-hooks/deploy/99-hysteria-restart.sh <<'EOF'
 #!/bin/sh
@@ -1085,27 +928,15 @@ chmod +x /etc/letsencrypt/renewal-hooks/deploy/99-hysteria-restart.sh
 systemctl daemon-reload
 systemctl enable --now hysteria-server.service
 systemctl restart hysteria-server.service
-# Включаем таймер автообновления сертификатов certbot (если поддерживается).
 systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 print_status "Hysteria2 установлена"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# НАСТРОЙКА HAPROXY — SNI-МАРШРУТИЗАТОР
-#
-# Архитектура трафика:
-#   Клиент → 0.0.0.0:443 (TCP) → HAProxy
-#   HAProxy инспектирует TLS ClientHello (SNI) и роутит:
-#     SNI = HY2_DOMAIN       → 127.0.0.1:8444  (Hysteria2 masquerade, HTTPS)
-#     SNI = TELEMT_TLS_DOMAIN → 127.0.0.1:TELEMT_PORT (Telemt MTProto)
-#     SNI = XRAY_SNI          → 127.0.0.1:XRAY_PORT  (Xray VLESS Reality)
-#     default                 → Hysteria2 masquerade (выглядит как обычный сайт)
-#
-# HAProxy работает в режиме tcp (Layer 4), не терминирует TLS —
-# просто перенаправляет байты по SNI.
+# НАСТРОЙКА HAPROXY — SNI-МАРШРУТИЗАТОР (TCP, layer 4)
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Настройка HAProxy..."
 
-[ -f /etc/haproxy/haproxy.cfg ] && cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak.$(date +%F_%H%M%S) || true
+backup_file /etc/haproxy/haproxy.cfg
 
 cat > /etc/haproxy/haproxy.cfg <<EOF
 global
@@ -1161,7 +992,6 @@ backend bk_xray
     server xray 127.0.0.1:${XRAY_PORT} check inter 30s
 EOF
 
-# Проверяем синтаксис конфига перед применением.
 if haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1; then
   print_status "HAProxy конфиг валиден"
 else
@@ -1174,75 +1004,44 @@ systemctl restart haproxy
 print_status "HAProxy настроен"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# НАСТРОЙКА UFW (Uncomplicated Firewall)
-#
-# Открываем только необходимые порты:
-#   22/tcp  — SSH (обязательно, иначе потеряем доступ)
-#   80/tcp  — ACME HTTP challenge для certbot
-#   <HAProxy>/tcp — основной вход (обычно 443)
-#   443/udp — Hysteria2 (QUIC работает только на UDP!)
+# НАСТРОЙКА UFW
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Настройка UFW..."
 ufw allow 22/tcp comment "SSH"
 ufw allow 80/tcp comment "ACME"
 ufw allow ${HAPROXY_PORT}/tcp comment "HAProxy"
 ufw allow 443/udp comment "Hysteria2"
-ufw --force enable   # --force не спрашивает подтверждения
+ufw --force enable
 print_status "UFW настроен"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# УПРАВЛЯЮЩИЕ КОМАНДЫ
-# Каждая команда — отдельный исполняемый файл в /usr/local/bin/.
-# Все они source-ят /usr/local/lib/proxy-common.sh для доступа к функциям.
+# УПРАВЛЯЮЩИЕ КОМАНДЫ /usr/local/bin/*
+# Все они source-ят /usr/local/lib/proxy-common.sh.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── mainuser ─────────────────────────────────────────────────────────────────
-# Быстрый просмотр ссылок первого (главного) пользователя.
-# Удобно после установки или при быстрой проверке конфигурации.
 cat > /usr/local/bin/mainuser <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /usr/local/lib/proxy-common.sh
 
-USER="$(db_first_user)"
-if [[ -z "$USER" ]]; then
-  echo "Нет пользователей"
-  exit 1
-fi
-
-print_bundle "$USER"
+user="$(require_first_user)"
+print_bundle "$user"
 EOF
 chmod +x /usr/local/bin/mainuser
 
 # ─── userlist ─────────────────────────────────────────────────────────────────
-# Выводит пронумерованный список всех пользователей из БД.
 cat > /usr/local/bin/userlist <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /usr/local/lib/proxy-common.sh
 
-mapfile -t users < <(db_user_names)
-
-if [[ ${#users[@]} -eq 0 ]]; then
-  echo "Список пользователей пуст"
-  exit 1
-fi
-
-echo "Пользователи:"
-for i in "${!users[@]}"; do
-  echo "$((i+1)). ${users[$i]}"
-done
+db_print_users_indexed
 EOF
 chmod +x /usr/local/bin/userlist
 
 # ─── newuser ──────────────────────────────────────────────────────────────────
-# Интерактивное создание нового пользователя:
-#   1. Запрашивает имя, валидирует
-#   2. Генерирует UUID, пароль Hy2, MTProto-секрет
-#   3. Добавляет в БД
-#   4. Перегенерирует все конфиги
-#   5. Перезапускает сервисы
-#   6. Выводит ссылки нового пользователя
+# Интерактивно создаёт нового пользователя, обновляет конфиги и перезапускает сервисы.
 cat > /usr/local/bin/newuser <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1275,38 +1074,20 @@ EOF
 chmod +x /usr/local/bin/newuser
 
 # ─── rmuser ───────────────────────────────────────────────────────────────────
-# Удаление пользователя с защитой от удаления последнего.
-# Минимум один пользователь должен оставаться для работы сервисов.
+# Удаляет пользователя; защита от удаления последнего.
 cat > /usr/local/bin/rmuser <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /usr/local/lib/proxy-common.sh
 
-mapfile -t users < <(db_user_names)
+db_print_users_indexed "Нет пользователей для удаления."
 
-if [[ ${#users[@]} -eq 0 ]]; then
-  echo "Нет пользователей для удаления."
-  exit 1
-fi
-
-if [[ ${#users[@]} -le 1 ]]; then
+if [[ ${#USERS_ARR[@]} -le 1 ]]; then
   echo "Нельзя удалить последнего пользователя."
   exit 1
 fi
 
-echo "Пользователи:"
-for i in "${!users[@]}"; do
-  echo "$((i+1)). ${users[$i]}"
-done
-
-read -rp "Номер для удаления: " CHOICE
-if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || (( CHOICE < 1 || CHOICE > ${#users[@]} )); then
-  echo "Ошибка: номер от 1 до ${#users[@]}"
-  exit 1
-fi
-
-IDX=$((CHOICE - 1))
-SEL="${users[$IDX]}"
+SEL="$(db_pick_user "Номер для удаления")"
 
 db_remove_user "$SEL"
 render_all_configs
@@ -1317,50 +1098,25 @@ EOF
 chmod +x /usr/local/bin/rmuser
 
 # ─── sharelink ────────────────────────────────────────────────────────────────
-# Интерактивный выбор пользователя из списка и вывод всех его ссылок.
-# Используется для шаринга конфигурации с конкретным клиентом.
 cat > /usr/local/bin/sharelink <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /usr/local/lib/proxy-common.sh
 
-mapfile -t users < <(db_user_names)
-
-if [[ ${#users[@]} -eq 0 ]]; then
-  echo "Нет пользователей."
-  exit 1
-fi
-
-echo "Пользователи:"
-for i in "${!users[@]}"; do
-  echo "$((i+1)). ${users[$i]}"
-done
-
-read -rp "Выберите пользователя: " CHOICE
-if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || (( CHOICE < 1 || CHOICE > ${#users[@]} )); then
-  echo "Ошибка: номер от 1 до ${#users[@]}"
-  exit 1
-fi
-
-SEL="${users[$((CHOICE - 1))]}"
+db_print_users_indexed "Нет пользователей."
+SEL="$(db_pick_user "Выберите пользователя")"
 print_bundle "$SEL"
 EOF
 chmod +x /usr/local/bin/sharelink
 
 # ─── hy2info ──────────────────────────────────────────────────────────────────
-# Быстрый вывод Hysteria2-ссылки и QR для первого пользователя.
 cat > /usr/local/bin/hy2info <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /usr/local/lib/proxy-common.sh
 
-USER="$(db_first_user)"
-if [[ -z "$USER" ]]; then
-  echo "Нет пользователей"
-  exit 1
-fi
-
-LINK="$(hy2_link_for "$USER")"
+user="$(require_first_user)"
+LINK="$(hy2_link_for "$user")"
 echo ""
 echo "=== Hysteria2 ==="
 echo "$LINK"
@@ -1371,7 +1127,6 @@ EOF
 chmod +x /usr/local/bin/hy2info
 
 # ─── hy2list ──────────────────────────────────────────────────────────────────
-# Список пользователей с доступом к Hysteria2 (все пользователи из БД).
 cat > /usr/local/bin/hy2list <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1391,8 +1146,6 @@ EOF
 chmod +x /usr/local/bin/hy2list
 
 # ─── hy2links ─────────────────────────────────────────────────────────────────
-# Вывод всех Hysteria2-ссылок для всех пользователей сразу.
-# Удобно для массовой рассылки или аудита.
 cat > /usr/local/bin/hy2links <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1412,22 +1165,14 @@ EOF
 chmod +x /usr/local/bin/hy2links
 
 # ─── tglink ───────────────────────────────────────────────────────────────────
-# MTProto-ссылки первого пользователя в двух форматах:
-#   https://t.me/proxy?... — открывается в браузере, редиректит в Telegram
-#   tg://proxy?...         — открывается напрямую в Telegram-приложении
 cat > /usr/local/bin/tglink <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source /usr/local/lib/proxy-common.sh
 
-USER="$(db_first_user)"
-if [[ -z "$USER" ]]; then
-  echo "Нет пользователей"
-  exit 1
-fi
-
-HTTPS_LINK="$(tg_https_link_for "$USER")"
-TG_LINK="$(tg_scheme_link_for "$USER")"
+user="$(require_first_user)"
+HTTPS_LINK="$(tg_https_link_for "$user")"
+TG_LINK="$(tg_scheme_link_for "$user")"
 
 echo ""
 echo "=== Telegram MTProto Proxy ==="
@@ -1444,7 +1189,6 @@ EOF
 chmod +x /usr/local/bin/tglink
 
 # ─── telegramlinks ────────────────────────────────────────────────────────────
-# Все MTProto HTTPS-ссылки для всех пользователей одной командой.
 cat > /usr/local/bin/telegramlinks <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1464,8 +1208,6 @@ EOF
 chmod +x /usr/local/bin/telegramlinks
 
 # ─── proxystatus ──────────────────────────────────────────────────────────────
-# Быстрая диагностика: статус всех четырёх сервисов + открытые порты.
-# Первое место для проверки после установки или при проблемах.
 cat > /usr/local/bin/proxystatus <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1491,7 +1233,6 @@ done
 
 echo ""
 echo "=== Порты ==="
-# Показываем только интересующие нас порты: входные и внутренние
 ss -tlnup 2>/dev/null | grep -E "(:${HAPROXY_PORT}|:${XRAY_PORT}|:${TELEMT_PORT}|:80|:443|:8444)" || true
 echo ""
 EOF
@@ -1499,8 +1240,6 @@ chmod +x /usr/local/bin/proxystatus
 
 # ─────────────────────────────────────────────────────────────────────────────
 # СПРАВОЧНЫЙ ФАЙЛ /root/help
-# Краткая шпаргалка по командам и путям к конфигам.
-# Доступна сразу после установки: cat /root/help
 # ─────────────────────────────────────────────────────────────────────────────
 cat > /root/help <<'EOF'
 ============================================
@@ -1548,17 +1287,12 @@ Telegram / Telemt:
 EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ФИНАЛЬНЫЙ ПЕРЕЗАПУСК ВСЕХ СЕРВИСОВ
-# После установки делаем чистый reload systemd и рестарт,
-# чтобы все сервисы стартовали с актуальными конфигурациями.
+# ФИНАЛЬНЫЙ ПЕРЕЗАПУСК
 # ─────────────────────────────────────────────────────────────────────────────
 systemctl daemon-reload
-systemctl restart xray
-systemctl restart telemt
-systemctl restart hysteria-server.service
+restart_dynamic_services
 systemctl restart haproxy
 
-# ─── Итоговый вывод ──────────────────────────────────────────────────────────
 echo ""
 echo "============================================"
 print_status "Установка завершена"
@@ -1568,9 +1302,7 @@ echo "  Первый пользователь: ${FIRST_USER}"
 echo "============================================"
 echo ""
 
-# Сразу показываем ссылки первого пользователя.
 mainuser
 echo ""
 print_info "Справка: cat /root/help"
 print_info "Проверка: proxystatus"
-echo ""
