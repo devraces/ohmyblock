@@ -930,7 +930,8 @@ mkdir -p /etc/hysteria/masq /etc/hysteria/certs
 
 # Страница-заглушка (только если нет).
 if [[ ! -s /etc/hysteria/masq/index.html ]]; then
-cat > /etc/hysteria/masq/index.html <<'HTML'
+  mkdir -p /etc/hysteria/masq
+  cat > /etc/hysteria/masq/index.html <<'HTML'
 <!DOCTYPE html>
 <html>
 <head>
@@ -952,8 +953,8 @@ cat > /etc/hysteria/masq/index.html <<'HTML'
 </body>
 </html>
 HTML
+  chmod 644 /etc/hysteria/masq/index.html
 fi
-chmod 644 /var/www/masq/index.html
 
 # Hysteria2 user (используем!)
 if ! id hysteria &>/dev/null; then
