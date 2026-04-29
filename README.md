@@ -100,11 +100,16 @@ UFW разрешает только: 22/tcp, 80/tcp, `$HAPROXY_PORT`/tcp, 443/ud
 ### Быстрый старт
 ```bash
 # на VPS под root
-wget -O install.sh https://raw.githubusercontent.com/devraces/ohmyblock/refs/heads/main/ohmyblock.sh
+wget https://raw.githubusercontent.com/devraces/ohmyblock/refs/heads/main/ohmyblock.sh
 chmod +x ohmyblock.sh
 ./ohmyblock.sh
 ```
-
+```bash
+chmod +x ohmyblock.sh
+```
+```bash
+./ohmyblock.sh
+```
 Инсталлер задаст несколько вопросов и поднимет весь стек за 1–3 минуты.
 
 ### Что делает скрипт
