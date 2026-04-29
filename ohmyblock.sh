@@ -11,7 +11,7 @@
 # Идемпотентность: повторный запуск БЕЗ --reinstall сохраняет ключи Reality
 # и базу пользователей. С --reinstall — пересоздаёт всё с нуля.
 #
-# Автор оригинала: Alexdev. Production-rework.
+# Автор: Alexdev
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -Eeuo pipefail
@@ -261,7 +261,7 @@ XRAY_SNI="$(normalize_host "$XRAY_SNI")"
 XRAY_SNI="${XRAY_SNI#www.}"
 valid_domain "$XRAY_SNI" || { print_error "Неверный XRAY_SNI: $XRAY_SNI"; exit 1; }
 
-TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-$(ask "TLS-домен для Telemt" "${EXIST_TELEMT_TLS_DOMAIN:-www.microsoft.com}")}"
+TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-$(ask "TLS-домен для Telemt" "${EXIST_TELEMT_TLS_DOMAIN:-www.google.com}")}"
 TELEMT_TLS_DOMAIN="$(normalize_host "$TELEMT_TLS_DOMAIN")"
 valid_domain "$TELEMT_TLS_DOMAIN" || { print_error "Неверный TELEMT_TLS_DOMAIN"; exit 1; }
 
@@ -378,8 +378,10 @@ fi
 mkdir -p /usr/local/etc/xray /usr/local/etc/proxy /etc/telemt /etc/hysteria \
          /etc/hysteria/certs /opt/telemt /var/www/masq /usr/local/lib /var/lock
 chmod 755 /usr/local /usr/local/etc 2>/dev/null || true
-# Xray и proxy-DB читает только root → 700.
-chmod 700 /usr/local/etc/xray /usr/local/etc/proxy
+# proxy-DB читает только root → 700. /usr/local/etc/xray финальные права
+# выставим после создания пользователя xray (см. секцию XRAY).
+chmod 700 /usr/local/etc/proxy
+chmod 750 /usr/local/etc/xray
 # /etc/telemt и /etc/hysteria выставим финальные права после создания
 # соответствующих сервис-пользователей (chown сделаем ниже).
 chmod 750 /etc/telemt /etc/hysteria /etc/hysteria/certs
@@ -609,8 +611,14 @@ render_xray_config() {
   }
 }
 EOF2
-  chown root:root "$XRAY_CFG"
-  chmod 600 "$XRAY_CFG"
+  # Конфиг читает xray-сервис как пользователь xray. group-readable.
+  if id xray >/dev/null 2>&1; then
+    chown root:xray "$XRAY_CFG"
+    chmod 640 "$XRAY_CFG"
+  else
+    chown root:root "$XRAY_CFG"
+    chmod 600 "$XRAY_CFG"
+  fi
 }
 
 render_telemt_config() {
@@ -758,6 +766,13 @@ if ! command -v xray >/dev/null 2>&1; then
     @ install >/var/log/xray-install.log 2>&1
 fi
 
+# Xray service user (отдельный, не nobody — официальный инсталлер ставит
+# User=nobody, что systemd считает unsafe; перевешиваем на dedicated xray).
+if ! id xray &>/dev/null; then
+  useradd -r -U -d /usr/local/etc/xray -s /usr/sbin/nologin xray
+  print_status "Пользователь xray создан"
+fi
+
 # Ключи Reality.
 if $EXISTING_INSTALL && ! $REINSTALL && [[ -n "$(kv xray_private_key)" && -n "$(kv xray_public_key)" && -n "$(kv xray_short_id)" ]]; then
   PRIVATE_KEY="$(kv xray_private_key)"
@@ -823,13 +838,20 @@ chmod 600 "$KEYS"
 
 render_xray_config
 
-# ─── Лимиты Xray (мягкое hardening) ──────────────────────────────────────────
-# Жёсткие ProtectSystem/ReadWritePaths намеренно НЕ ставим: официальный
-# install-release.sh уже ставит unit с разумными настройками; агрессивный
-# sandboxing ломает обновление geoip/geosite и логирование.
+# ─── Хардиниг + переключение Xray на dedicated user ─────────────────────────
+# Официальный install-release.sh ставит User=nobody. Переключаем на xray.
+# Жёсткий ProtectSystem=strict не включаем — может ломать обновление geoip.
 mkdir -p /etc/systemd/system/xray.service.d /var/log/xray
+chown root:xray /var/log/xray 2>/dev/null || true
+chmod 750 /var/log/xray
+# Финальные права на конфиг-каталог (после useradd xray).
+chown root:xray /usr/local/etc/xray
+chmod 750 /usr/local/etc/xray
+# Сам конфиг был выставлен в render_xray_config (640 root:xray).
 cat > /etc/systemd/system/xray.service.d/override.conf <<'EOF'
 [Service]
+User=xray
+Group=xray
 LimitNOFILE=1048576
 EOF
 systemctl daemon-reload
