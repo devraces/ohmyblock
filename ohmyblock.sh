@@ -261,7 +261,7 @@ XRAY_SNI="$(normalize_host "$XRAY_SNI")"
 XRAY_SNI="${XRAY_SNI#www.}"
 valid_domain "$XRAY_SNI" || { print_error "Неверный XRAY_SNI: $XRAY_SNI"; exit 1; }
 
-TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-$(ask "TLS-домен для Telemt" "${EXIST_TELEMT_TLS_DOMAIN:-www.google.com}")}"
+TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-$(ask "TLS-домен для Telemt" "${EXIST_TELEMT_TLS_DOMAIN:-www.microsoft.com}")}"
 TELEMT_TLS_DOMAIN="$(normalize_host "$TELEMT_TLS_DOMAIN")"
 valid_domain "$TELEMT_TLS_DOMAIN" || { print_error "Неверный TELEMT_TLS_DOMAIN"; exit 1; }
 
