@@ -101,8 +101,6 @@ UFW разрешает только: 22/tcp, 80/tcp, `$HAPROXY_PORT`/tcp, 443/ud
 ```bash
 # на VPS под root
 wget https://raw.githubusercontent.com/devraces/ohmyblock/refs/heads/main/ohmyblock.sh
-chmod +x ohmyblock.sh
-./ohmyblock.sh
 ```
 ```bash
 chmod +x ohmyblock.sh
