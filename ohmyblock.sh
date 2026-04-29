@@ -11,7 +11,7 @@
 # Идемпотентность: повторный запуск БЕЗ --reinstall сохраняет ключи Reality
 # и базу пользователей. С --reinstall — пересоздаёт всё с нуля.
 #
-# Автор оригинала: Alexdev.
+# Автор оригинала: Alexdev. Production-rework.
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -Eeuo pipefail
@@ -261,7 +261,7 @@ XRAY_SNI="$(normalize_host "$XRAY_SNI")"
 XRAY_SNI="${XRAY_SNI#www.}"
 valid_domain "$XRAY_SNI" || { print_error "Неверный XRAY_SNI: $XRAY_SNI"; exit 1; }
 
-TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-$(ask "TLS-домен для Telemt" "${EXIST_TELEMT_TLS_DOMAIN:-www.google.com}")}"
+TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-$(ask "TLS-домен для Telemt" "${EXIST_TELEMT_TLS_DOMAIN:-www.microsoft.com}")}"
 TELEMT_TLS_DOMAIN="$(normalize_host "$TELEMT_TLS_DOMAIN")"
 valid_domain "$TELEMT_TLS_DOMAIN" || { print_error "Неверный TELEMT_TLS_DOMAIN"; exit 1; }
 
@@ -337,6 +337,7 @@ retry 3 5 apt-get update -y
 retry 3 5 apt-get install -y --no-install-recommends \
   curl wget jq tar openssl ca-certificates \
   qrencode haproxy certbot ufw util-linux iproute2 dnsutils
+# Примечание: команда `flock` входит в пакет util-linux (он уже выше).
 print_status "Пакеты установлены"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -377,11 +378,12 @@ fi
 mkdir -p /usr/local/etc/xray /usr/local/etc/proxy /etc/telemt /etc/hysteria \
          /etc/hysteria/certs /opt/telemt /var/www/masq /usr/local/lib /var/lock
 chmod 755 /usr/local /usr/local/etc 2>/dev/null || true
-
-# Xray и Hysteria должны быть доступны своим сервисным пользователям
-chmod 750 /usr/local/etc/xray /etc/hysteria
-chmod 700 /usr/local/etc/proxy /etc/telemt
-chmod 755 /etc/hysteria/certs
+# Xray и proxy-DB читает только root → 700.
+chmod 700 /usr/local/etc/xray /usr/local/etc/proxy
+# /etc/telemt и /etc/hysteria выставим финальные права после создания
+# соответствующих сервис-пользователей (chown сделаем ниже).
+chmod 750 /etc/telemt /etc/hysteria /etc/hysteria/certs
+chmod 755 /var/www/masq
 
 backup_file "$KEYS" 5
 backup_file "$USERS_DB" 5
@@ -544,7 +546,13 @@ tg_scheme_link_for() {
   printf 'tg://proxy?server=%s&port=%s&secret=%s\n' "$(public_host)" "$(public_port)" "$full"
 }
 show_qr() {
+  # QR-код печатаем всегда; в /dev/tty если стандартный stdout не TTY
+  # (полезно при tee в лог установки).
   if [[ -t 1 ]]; then
+    printf '%s\n' "$1" | qrencode -t ansiutf8
+  elif { : >/dev/tty; } 2>/dev/null; then
+    printf '%s\n' "$1" | qrencode -t ansiutf8 >/dev/tty
+  else
     printf '%s\n' "$1" | qrencode -t ansiutf8
   fi
 }
@@ -601,8 +609,8 @@ render_xray_config() {
   }
 }
 EOF2
-  chown xray:xray "$XRAY_CFG"
-  chmod 640 "$XRAY_CFG"
+  chown root:root "$XRAY_CFG"
+  chmod 600 "$XRAY_CFG"
 }
 
 render_telemt_config() {
@@ -649,15 +657,14 @@ render_telemt_config() {
 }
 
 render_hy2_config() {
-  local certname
-  certname="$(kv hy2_cert_name)"
-  [[ -z "$certname" ]] && certname="$(kv hy2_domain)"
+  # Сертификаты лежат в /etc/hysteria/certs/, владелец hysteria.
+  # Туда копирует и инсталлер, и LE renewal-hook.
   {
     echo "listen: :443"
     echo
     echo "tls:"
-    echo "  cert: /etc/letsencrypt/live/${certname}/fullchain.pem"
-    echo "  key: /etc/letsencrypt/live/${certname}/privkey.pem"
+    echo "  cert: /etc/hysteria/certs/fullchain.pem"
+    echo "  key: /etc/hysteria/certs/privkey.pem"
     echo
     echo "auth:"
     echo "  type: userpass"
@@ -695,8 +702,12 @@ render_hy2_config() {
     echo "  file:"
     echo "    dir: /var/www/masq"
   } > "$HY2_CFG"
-  chown root:hysteria "$HY2_CFG" 2>/dev/null || chown root:root "$HY2_CFG"
-  chmod 640 "$HY2_CFG"
+  # Конфиг читает hysteria. Делаем владельца — hysteria, чтобы не зависеть
+  # от прав на каталог при ProtectSystem=strict.
+  if id hysteria >/dev/null 2>&1; then
+    chown hysteria:hysteria "$HY2_CFG"
+  fi
+  chmod 600 "$HY2_CFG"
 }
 
 render_all_configs() {
@@ -746,13 +757,6 @@ if ! command -v xray >/dev/null 2>&1; then
   retry 3 5 bash -c "$(curl -4 -fsSL --connect-timeout 10 --max-time 120 https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
     @ install >/var/log/xray-install.log 2>&1
 fi
-
-# Пользователь для Xray
-if ! id xray &>/dev/null; then
-  useradd -r -U -d /usr/local/etc/xray -s /usr/sbin/nologin xray
-fi
-chown -R xray:xray /usr/local/etc/xray
-chmod 750 /usr/local/etc/xray
 
 # Ключи Reality.
 if $EXISTING_INSTALL && ! $REINSTALL && [[ -n "$(kv xray_private_key)" && -n "$(kv xray_public_key)" && -n "$(kv xray_short_id)" ]]; then
@@ -819,23 +823,15 @@ chmod 600 "$KEYS"
 
 render_xray_config
 
-# ─── Hardening unit-файла Xray (мягкое) ─────────────────────────────────────
-mkdir -p /etc/systemd/system/xray.service.d
+# ─── Лимиты Xray (мягкое hardening) ──────────────────────────────────────────
+# Жёсткие ProtectSystem/ReadWritePaths намеренно НЕ ставим: официальный
+# install-release.sh уже ставит unit с разумными настройками; агрессивный
+# sandboxing ломает обновление geoip/geosite и логирование.
+mkdir -p /etc/systemd/system/xray.service.d /var/log/xray
 cat > /etc/systemd/system/xray.service.d/override.conf <<'EOF'
 [Service]
-User=xray
-Group=xray
 LimitNOFILE=1048576
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-ProtectKernelTunables=true
-ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-ReadWritePaths=/usr/local/etc/xray /var/log/xray
 EOF
-mkdir -p /var/log/xray
 systemctl daemon-reload
 systemctl enable --now xray
 systemctl restart xray
@@ -943,8 +939,11 @@ if ! id hysteria &>/dev/null; then
   print_status "Пользователь hysteria создан"
 fi
 
-chown root:hysteria /etc/hysteria
-chmod 750 /etc/hysteria
+# Финальные права /etc/hysteria и /var/www/masq для пользователя hysteria.
+chown root:hysteria /etc/hysteria /etc/hysteria/certs
+chmod 750 /etc/hysteria /etc/hysteria/certs
+chown -R hysteria:hysteria /var/www/masq
+chmod 755 /var/www/masq
 
 # DNS-проверка — мягкое предупреждение, не блокируем.
 RESOLVED_IP="$(getent hosts "$HY2_DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)"
@@ -982,11 +981,22 @@ else
 fi
 update_keys_field "$KEYS" hy2_cert_name "$CERT_NAME"
 
-# Дать группе hysteria доступ к live/archive.
-chgrp -R hysteria /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-chmod g+rx /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-find /etc/letsencrypt/live /etc/letsencrypt/archive -type d -exec chmod g+rx {} + 2>/dev/null || true
-find /etc/letsencrypt/archive -type f -name 'privkey*.pem' -exec chmod g+r {} + 2>/dev/null || true
+# ─── Копируем сертификат в /etc/hysteria/certs/ ──────────────────────────────
+# Не трогаем права /etc/letsencrypt (могут сломать другие приложения).
+# Hysteria читает свою копию, владелец — hysteria.
+copy_cert_for_hysteria() {
+  local name="$1"
+  local src_dir="/etc/letsencrypt/live/${name}"
+  if [[ ! -s "${src_dir}/fullchain.pem" || ! -s "${src_dir}/privkey.pem" ]]; then
+    print_error "Не найдены файлы сертификата ${src_dir}/{fullchain,privkey}.pem"
+    return 1
+  fi
+  install -m 644 -o hysteria -g hysteria \
+    "${src_dir}/fullchain.pem" /etc/hysteria/certs/fullchain.pem
+  install -m 600 -o hysteria -g hysteria \
+    "${src_dir}/privkey.pem" /etc/hysteria/certs/privkey.pem
+}
+copy_cert_for_hysteria "$CERT_NAME"
 
 # Установка hysteria.
 if ! command -v hysteria >/dev/null 2>&1; then
@@ -1010,7 +1020,7 @@ StartLimitBurst=5
 Type=simple
 User=hysteria
 Group=hysteria
-WorkingDirectory=/
+WorkingDirectory=/etc/hysteria
 ExecStart=${HYST_BIN} server -c /etc/hysteria/config.yaml
 Restart=on-failure
 RestartSec=2
@@ -1023,21 +1033,27 @@ ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6
-ReadWritePaths=/etc/hysteria /var/www/masq
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/etc/hysteria
+ReadOnlyPaths=/var/www/masq
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Renewal-хук: рестартуем hysteria + чиним группу-доступ к новым ключам.
+# Renewal-хук: при обновлении LE-серта копируем новые файлы в
+# /etc/hysteria/certs/ (с правами hysteria) и рестартуем hysteria.
+# certbot экспортирует $RENEWED_LINEAGE — путь к /etc/letsencrypt/live/<name>/.
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 cat > /etc/letsencrypt/renewal-hooks/deploy/99-hysteria-restart.sh <<'EOF'
 #!/bin/sh
-chgrp -R hysteria /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-chmod g+rx /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-find /etc/letsencrypt/live /etc/letsencrypt/archive -type d -exec chmod g+rx {} + 2>/dev/null || true
-find /etc/letsencrypt/archive -type f -name 'privkey*.pem' -exec chmod g+r {} + 2>/dev/null || true
+set -eu
+DEST=/etc/hysteria/certs
+[ -d "$DEST" ] || mkdir -p "$DEST"
+if [ -n "${RENEWED_LINEAGE:-}" ] && [ -s "$RENEWED_LINEAGE/fullchain.pem" ]; then
+  install -m 644 -o hysteria -g hysteria "$RENEWED_LINEAGE/fullchain.pem" "$DEST/fullchain.pem"
+  install -m 600 -o hysteria -g hysteria "$RENEWED_LINEAGE/privkey.pem"   "$DEST/privkey.pem"
+fi
 systemctl restart hysteria-server.service 2>/dev/null || true
 EOF
 chmod +x /etc/letsencrypt/renewal-hooks/deploy/99-hysteria-restart.sh
