@@ -708,7 +708,7 @@ render_hy2_config() {
     echo "  listenHTTPS: :8444"
     echo "  forceHTTPS: true"
     echo "  file:"
-    echo "    dir: /var/www/masq"
+    echo "    dir: /etc/hysteria/masq"
   } > "$HY2_CFG"
   # Конфиг читает hysteria. Делаем владельца — hysteria, чтобы не зависеть
   # от прав на каталог при ProtectSystem=strict.
@@ -926,11 +926,11 @@ print_status "Telemt работает"
 # HYSTERIA2
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Установка/обновление Hysteria2..."
-mkdir -p /var/www/masq /etc/hysteria/certs
+mkdir -p /etc/hysteria/masq /etc/hysteria/certs
 
 # Страница-заглушка (только если нет).
-if [[ ! -s /var/www/masq/index.html ]]; then
-cat > /var/www/masq/index.html <<'HTML'
+if [[ ! -s /etc/hysteria/masq/index.html ]]; then
+cat > /etc/hysteria/masq/index.html <<'HTML'
 <!DOCTYPE html>
 <html>
 <head>
@@ -964,8 +964,8 @@ fi
 # Финальные права /etc/hysteria и /var/www/masq для пользователя hysteria.
 chown root:hysteria /etc/hysteria /etc/hysteria/certs
 chmod 750 /etc/hysteria /etc/hysteria/certs
-chown -R hysteria:hysteria /var/www/masq
-chmod 755 /var/www/masq
+chown -R hysteria:hysteria /etc/hysteria/masq
+chmod 755 /etc/hysteria/masq
 
 # DNS-проверка — мягкое предупреждение, не блокируем.
 RESOLVED_IP="$(getent hosts "$HY2_DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)"
@@ -1057,7 +1057,6 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
 ReadWritePaths=/etc/hysteria
-ReadOnlyPaths=/var/www/masq
 
 [Install]
 WantedBy=multi-user.target
