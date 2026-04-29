@@ -161,7 +161,7 @@ HY2_DOMAIN=proxy.example.com \
 HY2_EMAIL=admin@example.com \
 PUBLIC_HOST=proxy.example.com \
 FIRST_USER=main \
-./install.sh --noninteractive
+./ohmyblock.sh --noninteractive
 ```
 
 ---
@@ -318,7 +318,7 @@ fs.file-max = 1048576
 - HAProxy конфиг проверяется через `haproxy -c -f` ДО `systemctl restart`. При невалидной конфигурации выполняется автооткат к последнему бэкапу.
 
 ### Бэкапы
-- При каждом запуске `install.sh` бэкапятся `.keys`, `users.json`, `haproxy.cfg` (хранятся последние 5 версий).
+- При каждом запуске `ohmyblock.sh` бэкапятся `.keys`, `users.json`, `haproxy.cfg` (хранятся последние 5 версий).
 - Файлы `*.bak.<timestamp>` лежат рядом с оригиналами.
 
 ### Firewall
@@ -370,7 +370,7 @@ journalctl -u <service> -n 100 --no-pager
 haproxy -c -f /etc/haproxy/haproxy.cfg
 journalctl -u haproxy -n 50
 ```
-Если конфиг битый — `install.sh` сам откатит на последний бэкап. Если автоматически не откатил, см. `/etc/haproxy/haproxy.cfg.bak.*`.
+Если конфиг битый — `ohmyblock.sh` сам откатит на последний бэкап. Если автоматически не откатил, см. `/etc/haproxy/haproxy.cfg.bak.*`.
 
 **Xray не стартует**
 ```bash
@@ -487,7 +487,7 @@ apt purge -y haproxy certbot
 ## FAQ
 
 **Можно ли использовать порт, отличный от 443, для HAProxy?**
-Да: `HAPROXY_PORT=8443 ./install.sh --noninteractive`. Но Reality + HTTPS-маскировка наиболее правдоподобны именно на 443. Hysteria2 всегда занимает UDP/443.
+Да: `HAPROXY_PORT=8443 ./ohmyblock.sh --noninteractive`. Но Reality + HTTPS-маскировка наиболее правдоподобны именно на 443. Hysteria2 всегда занимает UDP/443.
 
 **Можно ли разместить за CDN (Cloudflare и т.п.)?**
 - Hysteria2 (UDP) — нет, CDN-ы не проксируют UDP.
@@ -502,7 +502,7 @@ apt purge -y haproxy certbot
 Технически да (если на клиенте `insecure=1`), но это палится при пассивном анализе TLS. Для prod — только LE.
 
 **Где лежит лог установки?**
-`/var/log/proxy-install.log` — содержит всё, что выводилось во время `install.sh`.
+`/var/log/proxy-install.log` — содержит всё, что выводилось во время `ohmyblock.sh`.
 
 **Что делать после reboot?**
 Ничего. Все сервисы под systemd с `WantedBy=multi-user.target` — стартуют автоматически.
@@ -521,7 +521,7 @@ done
 
 **Как мигрировать на другую VPS?**
 1. На старой машине: `tar czf backup.tgz /usr/local/etc/xray /usr/local/etc/proxy /etc/letsencrypt /etc/hysteria/certs`.
-2. На новой: установи `install.sh` с теми же доменами/SNI, ОСТАНОВИ сервисы, развернуть архив, запусти `install.sh` повторно (без `--reinstall`).
+2. На новой: установи `ohmyblock.sh` с теми же доменами/SNI, ОСТАНОВИ сервисы, развернуть архив, запусти `ohmyblock.sh` повторно (без `--reinstall`).
 Все клиентские ссылки продолжат работать.
 
 ---
