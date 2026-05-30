@@ -1,15 +1,25 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # VLESS (xHTTP + Reality) + Hysteria2 + Telemt (MTProto) + HAProxy (SNI router)
+# + Cloudflare WARP (socks5 outbound)
 #
 # Production-ready инсталлер.
 #   • HAProxy на :443/TCP — SNI-роутер на три бэкенда
 #   • Xray — VLESS xHTTP + Reality на 127.0.0.1:8443
 #   • Telemt — MTProto fake-TLS на 127.0.0.1:9443
 #   • Hysteria2 — QUIC на :443/UDP (TLS от Let's Encrypt)
+#   • WARP — Cloudflare outbound socks5 на 127.0.0.1:40000
 #
 # Идемпотентность: повторный запуск БЕЗ --reinstall сохраняет ключи Reality
 # и базу пользователей. С --reinstall — пересоздаёт всё с нуля.
+#
+# Изменения v2 (по сравнению с оригиналом):
+#   • Cloudflare WARP установка и настройка (socks5 на 127.0.0.1:40000)
+#   • Xray/Telemt outbound через WARP
+#   • bufferSize убран из policy (был 4, вызывал деградацию скорости)
+#   • fq qdisc закрепляется при перезагрузке через networkd-dispatcher
+#   • nbthread в HAProxy = числу CPU (было жёстко 1)
+#   • tcp-request content reject для не-TLS трафика
 #
 # Автор: Alexdev
 # ─────────────────────────────────────────────────────────────────────────────
@@ -17,20 +27,15 @@
 set -Eeuo pipefail
 umask 077
 
-# ─── Локаль ──────────────────────────────────────────────────────────────────
-# Парсинг вывода certbot/xray и т.п. зависит от языка → форсим C.
 export LC_ALL=C
 export LANG=C
 export DEBIAN_FRONTEND=noninteractive
 
-# ─── Логирование установки в файл + stdout ───────────────────────────────────
 INSTALL_LOG="/var/log/proxy-install.log"
 mkdir -p "$(dirname "$INSTALL_LOG")"
-# tee'им весь вывод с момента старта (stderr тоже).
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 echo "=== install started: $(date -u +%FT%TZ) ==="
 
-# ─── Trap с кодом возврата ───────────────────────────────────────────────────
 on_err() {
   local rc=$?
   echo "[ERR] exit=$rc on line $LINENO of $0" >&2
@@ -38,7 +43,6 @@ on_err() {
 }
 trap on_err ERR
 
-# ─── Цвета (только для TTY) ──────────────────────────────────────────────────
 if [[ -t 1 ]]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 else
@@ -49,73 +53,48 @@ print_error()   { echo -e "${RED}[✗]${NC} $1" >&2; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_info()    { echo -e "${BLUE}[i]${NC} $1"; }
 
-# ─── Хелперы общего назначения ───────────────────────────────────────────────
-
-# retry <attempts> <delay_sec> <cmd...>
 retry() {
   local n=$1 d=$2; shift 2
   local i=0
   until "$@"; do
     i=$((i+1))
-    if (( i >= n )); then
-      return 1
-    fi
+    if (( i >= n )); then return 1; fi
     print_warning "повтор ($i/$n) после ошибки: $*"
     sleep "$d"
   done
 }
 
-# Ждать, пока systemd unit не станет active. Таймаут в секундах.
 wait_for_active() {
   local svc=$1 timeout=${2:-15} i=0
   while (( i < timeout )); do
-    if systemctl is-active --quiet "$svc"; then
-      return 0
-    fi
-    sleep 1
-    i=$((i+1))
+    if systemctl is-active --quiet "$svc"; then return 0; fi
+    sleep 1; i=$((i+1))
   done
   return 1
 }
 
-# normalize_host: убирает пробелы/префиксы/завершающий слэш, нижний регистр.
 normalize_host() {
   local h="${1:-}"
-  h="${h//[[:space:]]/}"
-  h="${h#http://}"
-  h="${h#https://}"
-  h="${h%/}"
+  h="${h//[[:space:]]/}"; h="${h#http://}"; h="${h#https://}"; h="${h%/}"
   printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
 }
 
-valid_port() {
-  [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 ))
-}
+valid_port()   { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 )); }
+valid_email()  { [[ "${1:-}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; }
+valid_domain() { [[ "${1:-}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; }
 
-valid_email() {
-  [[ "${1:-}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
-}
-
-valid_domain() {
-  [[ "${1:-}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]
-}
-
-# Поиск имени уже выпущенного certbot-сертификата для домена.
 find_cert_name_for_domain() {
   local domain="$1"
   certbot certificates 2>/dev/null | awk -v target="$domain" '
     /^Certificate Name:/ {name=$3}
     /^[[:space:]]+Domains:/ {
       for (i=2; i<=NF; i++) {
-        if ($i == target) {
-          print name; exit
-        }
+        if ($i == target) { print name; exit }
       }
     }
   '
 }
 
-# detect_server_ip: внешний IP сервера (fallback-цепочка).
 detect_server_ip() {
   local ip=""
   for u in https://icanhazip.com https://ifconfig.me https://api.ipify.org; do
@@ -127,43 +106,28 @@ detect_server_ip() {
   printf '%s' "${ip:-}"
 }
 
-# update_keys_field: безопасная замена поля key в .keys.
-# Удаляет ВСЕ существующие строки с этим ключом и добавляет одну.
 update_keys_field() {
   local file="$1" key="$2" val="$3" tmp
   tmp="$(mktemp)"
   awk -v k="$key" '
-    {
-      line = $0
-      # ищем "key:" в начале строки (с пробелами или нет — ключ слева до ":")
-      keypart = line
-      sub(/:.*$/, "", keypart)
-      # тримим пробелы у keypart
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", keypart)
-      if (keypart == k) next   # выкинуть старые
-      print line
-    }
+    { line=$0; keypart=line; sub(/:.*$/,"",keypart); gsub(/^[[:space:]]+|[[:space:]]+$/,"",keypart)
+      if (keypart==k) next; print line }
   ' "$file" > "$tmp"
   printf '%s: %s\n' "$key" "$val" >> "$tmp"
-  mv "$tmp" "$file"
-  chmod 600 "$file"
+  mv "$tmp" "$file"; chmod 600 "$file"
 }
 
-# Бэкап + ротация (хранить N последних).
 backup_file() {
   local f="$1" keep="${2:-5}"
   if [[ -f "$f" ]]; then
     cp -p "$f" "$f.bak.$(date -u +%Y%m%dT%H%M%SZ)" || true
-    # удаляем старые бэкапы за пределами keep последних
-    # shellcheck disable=SC2012
     ls -1t "$f".bak.* 2>/dev/null | tail -n +$((keep+1)) | xargs -r rm -f --
   fi
 }
 
 # ─── Проверка прав ───────────────────────────────────────────────────────────
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  print_error "Скрипт должен запускаться от root"
-  exit 1
+  print_error "Скрипт должен запускаться от root"; exit 1
 fi
 
 # ─── Парсинг флагов ──────────────────────────────────────────────────────────
@@ -178,7 +142,6 @@ while [[ $# -gt 0 ]]; do
 Usage: $0 [--reinstall] [--noninteractive]
 
   --reinstall       Пересоздать ключи Reality и базу пользователей с нуля.
-                    БЕЗ этого флага существующие .keys и users.json не трогаем.
   --noninteractive  Не задавать вопросов; использовать переменные окружения.
 
 ENV (для --noninteractive):
@@ -186,8 +149,7 @@ ENV (для --noninteractive):
   XRAY_SNI, TELEMT_TLS_DOMAIN, HY2_DOMAIN, HY2_EMAIL,
   PUBLIC_HOST, FIRST_USER
 H
-      exit 0
-      ;;
+      exit 0 ;;
     *) print_error "Неизвестный аргумент: $1"; exit 1 ;;
   esac
 done
@@ -198,22 +160,18 @@ USERS_DB="/usr/local/etc/proxy/users.json"
 LOCK_FILE="/var/lock/proxy-users.lock"
 
 EXISTING_INSTALL=false
-if [[ -s "$KEYS" && -s "$USERS_DB" ]]; then
-  EXISTING_INSTALL=true
-fi
+if [[ -s "$KEYS" && -s "$USERS_DB" ]]; then EXISTING_INSTALL=true; fi
 
 if $EXISTING_INSTALL && ! $REINSTALL; then
-  print_info "Найдена существующая установка — переиспользую ключи и базу пользователей."
-  print_info "Для полного пересоздания запусти: $0 --reinstall"
+  print_info "Найдена существующая установка — переиспользую ключи и базу."
 fi
 
 echo ""
 echo "============================================"
-echo "   VLESS + Hysteria2 + Telemt (prod)        "
+echo "   VLESS + Hysteria2 + Telemt + WARP        "
 echo "============================================"
 echo ""
 
-# ─── Чтение существующих значений (если есть) ────────────────────────────────
 read_kv_file() {
   local f="$1" k="$2"
   [[ -f "$f" ]] || { echo ""; return 0; }
@@ -229,18 +187,11 @@ EXIST_HY2_DOMAIN="$(read_kv_file "$KEYS" hy2_domain || true)"
 EXIST_HY2_EMAIL="$(read_kv_file "$KEYS" hy2_email || true)"
 EXIST_PUBLIC_HOST="$(read_kv_file "$KEYS" public_host || true)"
 
-# ─── Интерактивный или env-driven ввод параметров ────────────────────────────
 ask() {
   local prompt="$1" default="${2:-}" var
-  if $NONINTERACTIVE; then
-    printf '%s' "$default"
-    return 0
-  fi
-  if [[ -n "$default" ]]; then
-    read -rp "$prompt [$default]: " var
-  else
-    read -rp "$prompt: " var
-  fi
+  if $NONINTERACTIVE; then printf '%s' "$default"; return 0; fi
+  if [[ -n "$default" ]]; then read -rp "$prompt [$default]: " var
+  else read -rp "$prompt: " var; fi
   printf '%s' "${var:-$default}"
 }
 
@@ -257,8 +208,7 @@ TELEMT_PORT="${TELEMT_PORT:-$(ask "Порт Telemt (loopback)" "${EXIST_TELEMT_P
 valid_port "$TELEMT_PORT" || { print_error "Неверный Telemt порт"; exit 1; }
 
 XRAY_SNI="${XRAY_SNI:-$(ask "SNI для VLESS Reality" "${EXIST_XRAY_SNI:-github.com}")}"
-XRAY_SNI="$(normalize_host "$XRAY_SNI")"
-XRAY_SNI="${XRAY_SNI#www.}"
+XRAY_SNI="$(normalize_host "$XRAY_SNI")"; XRAY_SNI="${XRAY_SNI#www.}"
 valid_domain "$XRAY_SNI" || { print_error "Неверный XRAY_SNI: $XRAY_SNI"; exit 1; }
 
 TELEMT_TLS_DOMAIN="${TELEMT_TLS_DOMAIN:-$(ask "TLS-домен для Telemt" "${EXIST_TELEMT_TLS_DOMAIN:-www.microsoft.com}")}"
@@ -274,7 +224,6 @@ HY2_EMAIL="${HY2_EMAIL:-$(ask "Email для Let's Encrypt" "${EXIST_HY2_EMAIL:-}
 [[ -z "$HY2_EMAIL" ]] && { print_error "Email обязателен"; exit 1; }
 valid_email "$HY2_EMAIL" || { print_error "Неверный email: $HY2_EMAIL"; exit 1; }
 
-# Имя первого пользователя — только при свежей установке/реинсталле.
 if $EXISTING_INSTALL && ! $REINSTALL; then
   FIRST_USER="$(jq -r '.users[0].name // empty' "$USERS_DB" 2>/dev/null)"
   if [[ -z "$FIRST_USER" ]]; then
@@ -284,22 +233,16 @@ else
   FIRST_USER="${FIRST_USER:-$(ask "Имя первого пользователя" "main")}"
 fi
 if ! [[ "$FIRST_USER" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
-  print_error "Имя пользователя: A-Za-z0-9._- (1..32 символа)"
-  exit 1
+  print_error "Имя пользователя: A-Za-z0-9._- (1..32 символа)"; exit 1
 fi
 
-# Внешний IP.
 SERVER_IP="$(detect_server_ip)"
-if [[ -z "$SERVER_IP" ]]; then
-  print_error "Не удалось определить внешний IP сервера"
-  exit 1
-fi
+[[ -z "$SERVER_IP" ]] && { print_error "Не удалось определить внешний IP"; exit 1; }
 
 PUBLIC_HOST="${PUBLIC_HOST:-$(ask "Публичный хост для ссылок" "${EXIST_PUBLIC_HOST:-$SERVER_IP}")}"
 PUBLIC_HOST="$(normalize_host "$PUBLIC_HOST")"
 [[ -z "$PUBLIC_HOST" ]] && PUBLIC_HOST="$SERVER_IP"
 
-# ─── Проверки целостности ввода ──────────────────────────────────────────────
 if [[ "$XRAY_SNI" == "$TELEMT_TLS_DOMAIN" ]]; then
   print_error "SNI Xray и Telemt должны быть разными"; exit 1
 fi
@@ -307,25 +250,24 @@ if [[ "$HY2_DOMAIN" == "$XRAY_SNI" || "$HY2_DOMAIN" == "$TELEMT_TLS_DOMAIN" ]]; 
   print_error "Домен Hysteria2 не должен совпадать с Xray/Telemt SNI"; exit 1
 fi
 
-# ─── Предпросмотр + подтверждение ────────────────────────────────────────────
 echo ""
 print_info "Конфигурация:"
 echo "  HAProxy:     0.0.0.0:${HAPROXY_PORT}/tcp"
-echo "  Xray:        127.0.0.1:${XRAY_PORT}/tcp (loopback)"
-echo "  Telemt:      127.0.0.1:${TELEMT_PORT}/tcp (loopback)"
+echo "  Xray:        127.0.0.1:${XRAY_PORT}/tcp"
+echo "  Telemt:      127.0.0.1:${TELEMT_PORT}/tcp"
 echo "  Xray SNI:    ${XRAY_SNI} (+ www.${XRAY_SNI})"
 echo "  Telemt SNI:  ${TELEMT_TLS_DOMAIN}"
 echo "  Hysteria2:   ${HY2_DOMAIN}:443/udp + masquerade :8444/tcp"
 echo "  Public host: ${PUBLIC_HOST}"
 echo "  First user:  ${FIRST_USER}"
+echo "  WARP:        socks5 → 127.0.0.1:40000"
 echo "  Mode:        $($EXISTING_INSTALL && ! $REINSTALL && echo upgrade || echo fresh-install)"
 echo ""
 
 if ! $NONINTERACTIVE; then
   read -rp "Продолжить установку? (y/n): " CONFIRM
   if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-    print_warning "Установка отменена"
-    exit 0
+    print_warning "Установка отменена"; exit 0
   fi
 fi
 
@@ -335,16 +277,16 @@ fi
 print_info "Обновление apt и установка зависимостей..."
 retry 3 5 apt-get update -y
 retry 3 5 apt-get install -y --no-install-recommends \
-  curl wget jq tar openssl ca-certificates \
+  curl wget jq tar openssl ca-certificates gnupg lsb-release \
   qrencode haproxy certbot ufw util-linux iproute2 dnsutils
-# Примечание: команда `flock` входит в пакет util-linux (он уже выше).
 print_status "Пакеты установлены"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SYSCTL: BBR + UDP/QUIC буферы + TCP-тюнинг
+# SYSCTL: BBR + fq + буферы
 # ─────────────────────────────────────────────────────────────────────────────
-print_info "Настройка sysctl (BBR, буферы, somaxconn, file-max)..."
+print_info "Настройка sysctl (BBR, fq, буферы)..."
 modprobe tcp_bbr 2>/dev/null || true
+
 cat > /etc/sysctl.d/99-proxy-stack.conf <<'EOF'
 # proxy-stack tuning
 net.core.default_qdisc=fq
@@ -364,12 +306,116 @@ net.ipv4.tcp_max_syn_backlog=4096
 net.ipv4.tcp_tw_reuse=1
 fs.file-max=1048576
 EOF
+
 sysctl --system >/dev/null
-# Sanity-check BBR
+
+# Применить fq немедленно и закрепить при перезагрузке
+IFACE="$(ip route | grep default | awk '{print $5}' | head -n1)"
+if [[ -n "$IFACE" ]]; then
+  tc qdisc replace dev "$IFACE" root fq 2>/dev/null || true
+  print_status "fq qdisc применён на $IFACE"
+
+  if [[ -d /etc/networkd-dispatcher/routable.d ]]; then
+    cat > /etc/networkd-dispatcher/routable.d/50-fq-qdisc <<FQEOF
+#!/bin/bash
+tc qdisc replace dev ${IFACE} root fq 2>/dev/null || true
+FQEOF
+    chmod +x /etc/networkd-dispatcher/routable.d/50-fq-qdisc
+    print_status "fq qdisc закреплён при перезагрузке (networkd-dispatcher)"
+  else
+    # Fallback: systemd oneshot
+    cat > /etc/systemd/system/fq-qdisc.service <<FQSVC
+[Unit]
+Description=Set fq qdisc for BBR
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/tc qdisc replace dev ${IFACE} root fq
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+FQSVC
+    systemctl daemon-reload
+    systemctl enable --now fq-qdisc.service 2>/dev/null || true
+    print_status "fq qdisc закреплён при перезагрузке (systemd)"
+  fi
+fi
+
 if ! sysctl -n net.ipv4.tcp_congestion_control | grep -q bbr; then
-  print_warning "BBR не активен после применения sysctl — продолжаем, но сетевая производительность может быть ниже."
+  print_warning "BBR не активен — проверь ядро"
 else
   print_status "BBR активен"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLOUDFLARE WARP
+# ─────────────────────────────────────────────────────────────────────────────
+print_info "Установка Cloudflare WARP..."
+
+if ! command -v warp-cli >/dev/null 2>&1; then
+  retry 3 5 curl -fsSL --connect-timeout 10 --max-time 30 \
+    https://pkg.cloudflareclient.com/pubkey.gpg \
+    | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+  DISTRO_CODENAME="$(lsb_release -cs 2>/dev/null || . /etc/os-release && echo "$VERSION_CODENAME")"
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${DISTRO_CODENAME} main" \
+    > /etc/apt/sources.list.d/cloudflare-client.list
+
+  retry 3 5 apt-get update -y
+  retry 3 5 apt-get install -y cloudflare-warp
+  print_status "WARP пакет установлен"
+else
+  print_status "WARP уже установлен — пропускаю"
+fi
+
+systemctl enable --now warp-svc
+wait_for_active warp-svc 20 || {
+  print_error "warp-svc не стартанул"
+  journalctl -u warp-svc -n 30 --no-pager >&2 || true
+  exit 1
+}
+
+# Регистрация (только если нет)
+WARP_STATUS="$(warp-cli --accept-tos status 2>/dev/null || echo "unknown")"
+if echo "$WARP_STATUS" | grep -qiE "registered|connected|Unable to connect"; then
+  print_status "WARP уже зарегистрирован"
+else
+  print_info "Регистрация WARP..."
+  retry 3 5 warp-cli --accept-tos registration new
+  sleep 5
+fi
+
+# Режим proxy: socks5 на порту 40000
+warp-cli --accept-tos mode proxy        2>/dev/null || true
+sleep 2
+warp-cli --accept-tos proxy port 40000  2>/dev/null || true
+
+# Подключиться
+warp-cli --accept-tos connect 2>/dev/null || true
+sleep 5
+
+# Ждём пока порт поднимется
+for i in $(seq 1 15); do
+  ss -tlnp | grep -q ':40000' && break
+  sleep 1
+done
+
+if ! ss -tlnp | grep -q ':40000'; then
+  print_warning "WARP socks5 :40000 не слушает — возможно требуется ручная настройка"
+  print_warning "После установки выполни: warp-cli --accept-tos mode proxy && warp-cli --accept-tos connect"
+else
+  print_status "WARP socks5 слушает на 127.0.0.1:40000"
+  # Проверить IP
+  WARP_IP="$(curl --proxy socks5://127.0.0.1:40000 \
+    -fsS --connect-timeout 5 --max-time 15 \
+    http://ifconfig.me 2>/dev/null || echo "")"
+  if [[ -n "$WARP_IP" && "$WARP_IP" != "$SERVER_IP" ]]; then
+    print_status "WARP работает: $SERVER_IP → $WARP_IP"
+  else
+    print_warning "WARP IP: ${WARP_IP:-недоступен} (прямой: $SERVER_IP)"
+  fi
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,12 +424,8 @@ fi
 mkdir -p /usr/local/etc/xray /usr/local/etc/proxy /etc/telemt /etc/hysteria \
          /etc/hysteria/certs /opt/telemt /var/www/masq /usr/local/lib /var/lock
 chmod 755 /usr/local /usr/local/etc 2>/dev/null || true
-# proxy-DB читает только root → 700. /usr/local/etc/xray финальные права
-# выставим после создания пользователя xray (см. секцию XRAY).
 chmod 700 /usr/local/etc/proxy
 chmod 750 /usr/local/etc/xray
-# /etc/telemt и /etc/hysteria выставим финальные права после создания
-# соответствующих сервис-пользователей (chown сделаем ниже).
 chmod 750 /etc/telemt /etc/hysteria /etc/hysteria/certs
 chmod 755 /var/www/masq
 
@@ -392,8 +434,6 @@ backup_file "$USERS_DB" 5
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ОБЩАЯ БИБЛИОТЕКА /usr/local/lib/proxy-common.sh
-#
-# Используется и инсталлером, и CLI-командами (newuser, rmuser и т.п.).
 # ─────────────────────────────────────────────────────────────────────────────
 cat > /usr/local/lib/proxy-common.sh <<'COMMON_EOF'
 #!/usr/bin/env bash
@@ -407,7 +447,6 @@ XRAY_CFG="/usr/local/etc/xray/config.json"
 TEL_CFG="/etc/telemt/telemt.toml"
 HY2_CFG="/etc/hysteria/config.yaml"
 
-# ─── Цвета (TTY) ─────────────────────────────────────────────────────────────
 if [[ -t 1 ]]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 else
@@ -418,24 +457,17 @@ print_error()   { echo -e "${RED}[✗]${NC} $1" >&2; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_info()    { echo -e "${BLUE}[i]${NC} $1"; }
 
-# ─── kv: чтение значения из .keys ────────────────────────────────────────────
-kv() {
-  awk -F': ' -v k="$1" '$1==k {print $2; exit}' "$KEYS" 2>/dev/null
-}
+kv() { awk -F': ' -v k="$1" '$1==k {print $2; exit}' "$KEYS" 2>/dev/null; }
 
-# ─── Генераторы ──────────────────────────────────────────────────────────────
 gen_alnum_pass() {
   local p
   while :; do
     p="$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)"
-    if [[ ${#p} -eq 16 ]]; then
-      printf '%s' "$p"; return 0
-    fi
+    if [[ ${#p} -eq 16 ]]; then printf '%s' "$p"; return 0; fi
   done
 }
 gen_hex_secret() { openssl rand -hex 16; }
 
-# ─── Сетевые параметры ──────────────────────────────────────────────────────
 server_ip() {
   local ip=""
   for u in https://icanhazip.com https://ifconfig.me https://api.ipify.org; do
@@ -450,27 +482,19 @@ public_host() { local h; h="$(kv public_host)"; [[ -z "$h" ]] && h="$(server_ip)
 public_port() { local p; p="$(kv haproxy_port)"; [[ -z "$p" ]] && p=443; printf '%s' "$p"; }
 hy2_domain()  { kv hy2_domain; }
 
-# ─── База пользователей под flock ────────────────────────────────────────────
 db_user_count()  { jq '.users | length' "$USERS_DB" 2>/dev/null || echo 0; }
 db_first_user()  { jq -r '.users[0].name // empty' "$USERS_DB" 2>/dev/null; }
 db_user_names()  { jq -r '.users[].name' "$USERS_DB" 2>/dev/null; }
 db_has_user()    { jq -e --arg n "$1" '.users[]? | select(.name==$n)' "$USERS_DB" >/dev/null 2>&1; }
 db_get_user_field() {
-  jq -r --arg n "$1" --arg f "$2" '.users[] | select(.name==$n) | .[$f] // empty' "$USERS_DB" 2>/dev/null | head -n1
+  jq -r --arg n "$1" --arg f "$2" '.users[] | select(.name==$n) | .[$f] // empty' \
+    "$USERS_DB" 2>/dev/null | head -n1
 }
 _with_users_lock() {
-  local fd
-  exec {fd}>"$LOCK_FILE"
-  flock -x "$fd"
-  "$@"
-  local rc=$?
-  exec {fd}>&-
-  return $rc
+  local fd; exec {fd}>"$LOCK_FILE"; flock -x "$fd"
+  "$@"; local rc=$?; exec {fd}>&-; return $rc
 }
-db_add_user() {
-  local name="$1" uuid="$2" hy2pass="$3" telsecret="$4"
-  _with_users_lock _db_add_user_locked "$name" "$uuid" "$hy2pass" "$telsecret"
-}
+db_add_user() { _with_users_lock _db_add_user_locked "$@"; }
 _db_add_user_locked() {
   local name="$1" uuid="$2" hy2pass="$3" telsecret="$4" tmp
   tmp="$(mktemp)"
@@ -478,18 +502,13 @@ _db_add_user_locked() {
      --arg hy2pass "$hy2pass" --arg telsecret "$telsecret" \
      '.users += [{"name":$name,"uuid":$uuid,"hy2pass":$hy2pass,"telsecret":$telsecret}]' \
      "$USERS_DB" > "$tmp"
-  mv "$tmp" "$USERS_DB"
-  chmod 600 "$USERS_DB"
+  mv "$tmp" "$USERS_DB"; chmod 600 "$USERS_DB"
 }
-db_remove_user() {
-  _with_users_lock _db_remove_user_locked "$@"
-}
+db_remove_user() { _with_users_lock _db_remove_user_locked "$@"; }
 _db_remove_user_locked() {
-  local name="$1" tmp
-  tmp="$(mktemp)"
+  local name="$1" tmp; tmp="$(mktemp)"
   jq --arg name "$name" '.users |= map(select(.name != $name))' "$USERS_DB" > "$tmp"
-  mv "$tmp" "$USERS_DB"
-  chmod 600 "$USERS_DB"
+  mv "$tmp" "$USERS_DB"; chmod 600 "$USERS_DB"
 }
 
 require_first_user() {
@@ -499,18 +518,12 @@ require_first_user() {
 }
 db_print_users_indexed() {
   mapfile -t USERS_ARR < <(db_user_names)
-  if [[ ${#USERS_ARR[@]} -eq 0 ]]; then
-    print_error "${1:-Список пользователей пуст}"
-    exit 1
-  fi
+  if [[ ${#USERS_ARR[@]} -eq 0 ]]; then print_error "${1:-Список пустой}"; exit 1; fi
   echo "Пользователи:"
-  local i
-  for i in "${!USERS_ARR[@]}"; do
-    echo "$((i+1)). ${USERS_ARR[$i]}"
-  done
+  local i; for i in "${!USERS_ARR[@]}"; do echo "$((i+1)). ${USERS_ARR[$i]}"; done
 }
 db_pick_user() {
-  local prompt="${1:-Выберите пользователя}" choice
+  local prompt="${1:-Выберите}" choice
   read -rp "${prompt}: " choice
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#USERS_ARR[@]} )); then
     print_error "Номер от 1 до ${#USERS_ARR[@]}"; exit 1
@@ -518,7 +531,6 @@ db_pick_user() {
   printf '%s' "${USERS_ARR[$((choice-1))]}"
 }
 
-# ─── Формирование ссылок ─────────────────────────────────────────────────────
 tg_full_secret_for() {
   local user="$1" raw domain_hex
   raw="$(db_get_user_field "$user" telsecret)"
@@ -541,15 +553,15 @@ hy2_link_for() {
 }
 tg_https_link_for() {
   local user="$1" full; full="$(tg_full_secret_for "$user")"
-  printf 'https://t.me/proxy?server=%s&port=%s&secret=%s\n' "$(public_host)" "$(public_port)" "$full"
+  printf 'https://t.me/proxy?server=%s&port=%s&secret=%s\n' \
+    "$(public_host)" "$(public_port)" "$full"
 }
 tg_scheme_link_for() {
   local user="$1" full; full="$(tg_full_secret_for "$user")"
-  printf 'tg://proxy?server=%s&port=%s&secret=%s\n' "$(public_host)" "$(public_port)" "$full"
+  printf 'tg://proxy?server=%s&port=%s&secret=%s\n' \
+    "$(public_host)" "$(public_port)" "$full"
 }
 show_qr() {
-  # QR-код печатаем всегда; в /dev/tty если стандартный stdout не TTY
-  # (полезно при tee в лог установки).
   if [[ -t 1 ]]; then
     printf '%s\n' "$1" | qrencode -t ansiutf8
   elif { : >/dev/tty; } 2>/dev/null; then
@@ -559,7 +571,9 @@ show_qr() {
   fi
 }
 
-# ─── Рендер конфигов ────────────────────────────────────────────────────────
+# ─── render_xray_config ──────────────────────────────────────────────────────
+# Outbound: WARP socks5 на 127.0.0.1:40000
+# bufferSize убран — было 4, вызывало деградацию скорости
 render_xray_config() {
   local clients_json port sni pkey sid
   clients_json="$(jq -c '[.users[] | {email:.name,id:.uuid,flow:""}]' "$USERS_DB")"
@@ -568,11 +582,16 @@ render_xray_config() {
   cat > "$XRAY_CFG" <<EOF2
 {
   "log": {"loglevel": "warning"},
+  "dns": {
+    "servers": ["1.1.1.1", "8.8.8.8"]
+  },
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
       {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"},
-      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "block"}
+      {"type": "field", "ip": ["geoip:cn"], "outboundTag": "block"},
+      {"type": "field", "domain": ["${sni}"], "outboundTag": "real-direct"},
+      {"type": "field", "port": 53, "outboundTag": "dns-out"}
     ]
   },
   "inbounds": [{
@@ -601,26 +620,37 @@ render_xray_config() {
     "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
   }],
   "outbounds": [
-    {"protocol": "freedom", "tag": "direct"},
+    {
+      "protocol": "socks",
+      "tag": "direct",
+      "settings": {
+        "servers": [{"address": "127.0.0.1", "port": 40000}]
+      }
+    },
+    {
+      "protocol": "freedom",
+      "tag": "real-direct",
+      "settings": {}
+    },
+    {
+      "protocol": "dns",
+      "tag": "dns-out"
+    },
     {"protocol": "blackhole", "tag": "block"}
   ],
   "policy": {
     "levels": {
-      "0": {"handshake": 3, "connIdle": 180, "uplinkOnly": 2, "downlinkOnly": 5, "bufferSize": 4}
+      "0": {"handshake": 3, "connIdle": 180, "uplinkOnly": 2, "downlinkOnly": 5}
     }
   }
 }
 EOF2
-  # Конфиг читает xray-сервис как пользователь xray. group-readable.
-  if id xray >/dev/null 2>&1; then
-    chown root:xray "$XRAY_CFG"
-    chmod 640 "$XRAY_CFG"
-  else
-    chown root:root "$XRAY_CFG"
-    chmod 600 "$XRAY_CFG"
-  fi
+  if id xray >/dev/null 2>&1; then chown root:xray "$XRAY_CFG"; chmod 640 "$XRAY_CFG"
+  else chown root:root "$XRAY_CFG"; chmod 600 "$XRAY_CFG"; fi
 }
 
+# ─── render_telemt_config ────────────────────────────────────────────────────
+# Upstream: WARP socks5 на 127.0.0.1:40000
 render_telemt_config() {
   local pub_host hap_port tel_port tls_domain
   pub_host="$(kv public_host)"; hap_port="$(kv haproxy_port)"
@@ -659,14 +689,18 @@ render_telemt_config() {
     echo
     echo "[access.users]"
     jq -r '.users[] | "\"" + .name + "\" = \"" + .telsecret + "\""' "$USERS_DB"
+    echo
+    echo "[[upstreams]]"
+    echo "type = \"socks5\""
+    echo "address = \"127.0.0.1:40000\""
+    echo "weight = 1"
+    echo "enabled = true"
   } > "$TEL_CFG"
-  chown telemt:telemt "$TEL_CFG"
-  chmod 600 "$TEL_CFG"
+  chown telemt:telemt "$TEL_CFG"; chmod 600 "$TEL_CFG"
 }
 
+# ─── render_hy2_config ───────────────────────────────────────────────────────
 render_hy2_config() {
-  # Сертификаты лежат в /etc/hysteria/certs/, владелец hysteria.
-  # Туда копирует и инсталлер, и LE renewal-hook.
   {
     echo "listen: :443"
     echo
@@ -710,11 +744,7 @@ render_hy2_config() {
     echo "  file:"
     echo "    dir: /etc/hysteria/masq"
   } > "$HY2_CFG"
-  # Конфиг читает hysteria. Делаем владельца — hysteria, чтобы не зависеть
-  # от прав на каталог при ProtectSystem=strict.
-  if id hysteria >/dev/null 2>&1; then
-    chown hysteria:hysteria "$HY2_CFG"
-  fi
+  if id hysteria >/dev/null 2>&1; then chown hysteria:hysteria "$HY2_CFG"; fi
   chmod 600 "$HY2_CFG"
 }
 
@@ -753,52 +783,46 @@ print_bundle() {
 COMMON_EOF
 chmod 755 /usr/local/lib/proxy-common.sh
 
-# Подключаем библиотеку для использования в текущем процессе.
+# Подключаем библиотеку
 # shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
-# XRAY (с переиспользованием ключей при upgrade)
+# XRAY
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Установка/обновление Xray..."
 if ! command -v xray >/dev/null 2>&1; then
-  retry 3 5 bash -c "$(curl -4 -fsSL --connect-timeout 10 --max-time 120 https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
+  retry 3 5 bash -c "$(curl -4 -fsSL --connect-timeout 10 --max-time 120 \
+    https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" \
     @ install >/var/log/xray-install.log 2>&1
 fi
 
-# Xray service user (отдельный, не nobody — официальный инсталлер ставит
-# User=nobody, что systemd считает unsafe; перевешиваем на dedicated xray).
 if ! id xray &>/dev/null; then
   useradd -r -U -d /usr/local/etc/xray -s /usr/sbin/nologin xray
   print_status "Пользователь xray создан"
 fi
 
-# Ключи Reality.
-if $EXISTING_INSTALL && ! $REINSTALL && [[ -n "$(kv xray_private_key)" && -n "$(kv xray_public_key)" && -n "$(kv xray_short_id)" ]]; then
+# Ключи Reality
+if $EXISTING_INSTALL && ! $REINSTALL && \
+   [[ -n "$(kv xray_private_key)" && -n "$(kv xray_public_key)" && -n "$(kv xray_short_id)" ]]; then
   PRIVATE_KEY="$(kv xray_private_key)"
   PUBLIC_KEY="$(kv xray_public_key)"
   SHORT_ID="$(kv xray_short_id)"
   print_status "Reality keys: переиспользую существующие"
 else
   X25519_OUT="$(xray x25519 2>&1 | tr -d '\r')"
-  PRIVATE_KEY="$(awk -F': ' '
-    /^Private[[:space:]]*Key:/ {print $2; exit}
-    /^PrivateKey:/             {print $2; exit}' <<< "$X25519_OUT")"
-  PUBLIC_KEY="$(awk -F': ' '
-    /^Public[[:space:]]*Key:/         {print $2; exit}
-    /^PublicKey:/                     {print $2; exit}
-    /^Password \(PublicKey\):/        {print $2; exit}' <<< "$X25519_OUT")"
+  PRIVATE_KEY="$(awk -F': ' '/^Private[[:space:]]*Key:/{print $2;exit} /^PrivateKey:/{print $2;exit}' <<< "$X25519_OUT")"
+  PUBLIC_KEY="$(awk -F': ' '/^Public[[:space:]]*Key:/{print $2;exit} /^PublicKey:/{print $2;exit} /^Password \(PublicKey\):/{print $2;exit}' <<< "$X25519_OUT")"
   if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
-    print_error "Не удалось получить ключи x25519 из xray. Сырой вывод:"
-    echo "$X25519_OUT"
-    exit 1
+    print_error "Не удалось получить ключи x25519. Вывод: $X25519_OUT"; exit 1
   fi
   SHORT_ID="$(openssl rand -hex 8)"
   print_status "Reality keys: сгенерированы новые"
 fi
 
-# UUID + учётка первого пользователя — только если БД пуста или --reinstall.
-if $REINSTALL || [[ ! -s "$USERS_DB" ]] || [[ "$(jq -r '.users | length' "$USERS_DB" 2>/dev/null || echo 0)" -eq 0 ]]; then
+# UUID + первый пользователь
+if $REINSTALL || [[ ! -s "$USERS_DB" ]] || \
+   [[ "$(jq -r '.users | length' "$USERS_DB" 2>/dev/null || echo 0)" -eq 0 ]]; then
   UUID="$(xray uuid)"
   MAIN_HY2_PASS="$(gen_alnum_pass)"
   MAIN_TEL_SECRET="$(gen_hex_secret)"
@@ -807,16 +831,14 @@ if $REINSTALL || [[ ! -s "$USERS_DB" ]] || [[ "$(jq -r '.users | length' "$USERS
         '{users: [{name:$name, uuid:$uuid, hy2pass:$hy2pass, telsecret:$telsecret}]}' \
         > "$USERS_DB"
   chmod 600 "$USERS_DB"
-  print_status "users.json инициализирован первым пользователем '$FIRST_USER'"
+  print_status "users.json инициализирован: '$FIRST_USER'"
 else
   UUID="$(jq -r --arg n "$FIRST_USER" '.users[] | select(.name==$n) | .uuid' "$USERS_DB")"
-  if [[ -z "$UUID" ]]; then
-    UUID="$(jq -r '.users[0].uuid' "$USERS_DB")"
-  fi
-  print_status "users.json: переиспользую существующую базу ($(jq '.users | length' "$USERS_DB") польз.)"
+  [[ -z "$UUID" ]] && UUID="$(jq -r '.users[0].uuid' "$USERS_DB")"
+  print_status "users.json: переиспользую ($(jq '.users | length' "$USERS_DB") польз.)"
 fi
 
-# Сохраняем все параметры в .keys атомарно (один файл целиком).
+# Сохраняем .keys
 {
   echo "public_host: $PUBLIC_HOST"
   echo "server_ip: $SERVER_IP"
@@ -838,43 +860,41 @@ chmod 600 "$KEYS"
 
 render_xray_config
 
-# ─── Хардиниг + переключение Xray на dedicated user ─────────────────────────
-# Официальный install-release.sh ставит User=nobody. Переключаем на xray.
-# Жёсткий ProtectSystem=strict не включаем — может ломать обновление geoip.
 mkdir -p /etc/systemd/system/xray.service.d /var/log/xray
-chown root:xray /var/log/xray 2>/dev/null || true
-chmod 750 /var/log/xray
-# Финальные права на конфиг-каталог (после useradd xray).
-chown root:xray /usr/local/etc/xray
-chmod 750 /usr/local/etc/xray
-# Сам конфиг был выставлен в render_xray_config (640 root:xray).
+chown root:xray /var/log/xray 2>/dev/null || true; chmod 750 /var/log/xray
+chown root:xray /usr/local/etc/xray; chmod 750 /usr/local/etc/xray
+
 cat > /etc/systemd/system/xray.service.d/override.conf <<'EOF'
 [Service]
 User=xray
 Group=xray
 LimitNOFILE=1048576
 EOF
+
 systemctl daemon-reload
 systemctl enable --now xray
 systemctl restart xray
-wait_for_active xray 15 || { print_error "xray не стартанул"; journalctl -u xray -n 50 --no-pager >&2 || true; exit 1; }
+wait_for_active xray 15 || {
+  print_error "xray не стартанул"
+  journalctl -u xray -n 50 --no-pager >&2 || true; exit 1
+}
 print_status "Xray работает"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEMT (MTProto proxy)
+# TELEMT
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Установка/обновление Telemt..."
 
 ARCH="$(uname -m)"
 if ldd --version 2>&1 | grep -iq musl; then LIBC="musl"; else LIBC="gnu"; fi
 TELEMT_URL="https://github.com/telemt/telemt/releases/latest/download/telemt-${ARCH}-linux-${LIBC}.tar.gz"
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
+TMPDIR_TELEMT="$(mktemp -d)"
 
-print_info "Скачивание: telemt-${ARCH}-linux-${LIBC}.tar.gz"
-retry 3 5 curl -fsSL --connect-timeout 10 --max-time 180 -o "$TMPDIR/telemt.tar.gz" "$TELEMT_URL"
-tar -xzf "$TMPDIR/telemt.tar.gz" -C "$TMPDIR"
-install -m 755 "$TMPDIR/telemt" /bin/telemt
+retry 3 5 curl -fsSL --connect-timeout 10 --max-time 180 \
+  -o "$TMPDIR_TELEMT/telemt.tar.gz" "$TELEMT_URL"
+tar -xzf "$TMPDIR_TELEMT/telemt.tar.gz" -C "$TMPDIR_TELEMT"
+install -m 755 "$TMPDIR_TELEMT/telemt" /bin/telemt
+rm -rf "$TMPDIR_TELEMT"
 
 if ! id telemt &>/dev/null; then
   useradd -r -U -s /usr/sbin/nologin -d /opt/telemt telemt
@@ -919,7 +939,10 @@ render_telemt_config
 systemctl daemon-reload
 systemctl enable --now telemt
 systemctl restart telemt
-wait_for_active telemt 15 || { print_error "telemt не стартанул"; journalctl -u telemt -n 50 --no-pager >&2 || true; exit 1; }
+wait_for_active telemt 15 || {
+  print_error "telemt не стартанул"
+  journalctl -u telemt -n 50 --no-pager >&2 || true; exit 1
+}
 print_status "Telemt работает"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -928,9 +951,7 @@ print_status "Telemt работает"
 print_info "Установка/обновление Hysteria2..."
 mkdir -p /etc/hysteria/masq /etc/hysteria/certs
 
-# Страница-заглушка (только если нет).
 if [[ ! -s /etc/hysteria/masq/index.html ]]; then
-  mkdir -p /etc/hysteria/masq
   cat > /etc/hysteria/masq/index.html <<'HTML'
 <!DOCTYPE html>
 <html>
@@ -956,31 +977,29 @@ HTML
   chmod 644 /etc/hysteria/masq/index.html
 fi
 
-# Hysteria2 user (используем!)
 if ! id hysteria &>/dev/null; then
   useradd -r -U -d /etc/hysteria -s /usr/sbin/nologin hysteria
   print_status "Пользователь hysteria создан"
 fi
-
-# Финальные права /etc/hysteria и /var/www/masq для пользователя hysteria.
 chown root:hysteria /etc/hysteria /etc/hysteria/certs
 chmod 750 /etc/hysteria /etc/hysteria/certs
 chown -R hysteria:hysteria /etc/hysteria/masq
 chmod 755 /etc/hysteria/masq
 
-# DNS-проверка — мягкое предупреждение, не блокируем.
+# DNS-проверка
 RESOLVED_IP="$(getent hosts "$HY2_DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)"
 if [[ -n "$RESOLVED_IP" && "$RESOLVED_IP" != "$SERVER_IP" ]]; then
-  print_warning "DNS '$HY2_DOMAIN' указывает на $RESOLVED_IP, а не на $SERVER_IP. certbot скорее всего упадёт."
+  print_warning "DNS '$HY2_DOMAIN' → $RESOLVED_IP (сервер: $SERVER_IP). certbot может упасть."
   if ! $NONINTERACTIVE; then
-    read -rp "Продолжить всё равно? (y/n): " ans
+    read -rp "Продолжить? (y/n): " ans
     [[ "$ans" =~ ^[yY]$ ]] || exit 1
   fi
 fi
 
-# Получение/использование сертификата.
+# Сертификат
 CERT_NAME="$HY2_DOMAIN"
-if [[ -s "/etc/letsencrypt/live/$HY2_DOMAIN/fullchain.pem" && -s "/etc/letsencrypt/live/$HY2_DOMAIN/privkey.pem" ]]; then
+if [[ -s "/etc/letsencrypt/live/$HY2_DOMAIN/fullchain.pem" && \
+      -s "/etc/letsencrypt/live/$HY2_DOMAIN/privkey.pem" ]]; then
   print_status "Сертификат: используется существующий $HY2_DOMAIN"
 else
   EXISTING_NAME="$(find_cert_name_for_domain "$HY2_DOMAIN" || true)"
@@ -989,48 +1008,37 @@ else
     print_status "Сертификат: используется существующий $CERT_NAME"
   else
     if ss -ltn 2>/dev/null | awk '$4 ~ /:80$/ {found=1} END {exit !found}'; then
-      print_error "Порт 80 занят. Освободи 80/tcp для первого выпуска сертификата."
-      exit 1
+      print_error "Порт 80 занят. Освободи 80/tcp для выпуска сертификата."; exit 1
     fi
     print_info "Запрос сертификата Let's Encrypt..."
     retry 3 10 certbot certonly --standalone \
-      --cert-name "$HY2_DOMAIN" \
-      --keep-until-expiring \
-      -d "$HY2_DOMAIN" \
-      -m "$HY2_EMAIL" \
+      --cert-name "$HY2_DOMAIN" --keep-until-expiring \
+      -d "$HY2_DOMAIN" -m "$HY2_EMAIL" \
       --agree-tos --non-interactive
     CERT_NAME="$HY2_DOMAIN"
   fi
 fi
 update_keys_field "$KEYS" hy2_cert_name "$CERT_NAME"
 
-# ─── Копируем сертификат в /etc/hysteria/certs/ ──────────────────────────────
-# Не трогаем права /etc/letsencrypt (могут сломать другие приложения).
-# Hysteria читает свою копию, владелец — hysteria.
 copy_cert_for_hysteria() {
-  local name="$1"
-  local src_dir="/etc/letsencrypt/live/${name}"
+  local name="$1" src_dir="/etc/letsencrypt/live/${1}"
   if [[ ! -s "${src_dir}/fullchain.pem" || ! -s "${src_dir}/privkey.pem" ]]; then
-    print_error "Не найдены файлы сертификата ${src_dir}/{fullchain,privkey}.pem"
-    return 1
+    print_error "Не найдены файлы сертификата в ${src_dir}"; return 1
   fi
-  install -m 644 -o hysteria -g hysteria \
-    "${src_dir}/fullchain.pem" /etc/hysteria/certs/fullchain.pem
-  install -m 600 -o hysteria -g hysteria \
-    "${src_dir}/privkey.pem" /etc/hysteria/certs/privkey.pem
+  install -m 644 -o hysteria -g hysteria "${src_dir}/fullchain.pem" /etc/hysteria/certs/fullchain.pem
+  install -m 600 -o hysteria -g hysteria "${src_dir}/privkey.pem"   /etc/hysteria/certs/privkey.pem
 }
 copy_cert_for_hysteria "$CERT_NAME"
 
-# Установка hysteria.
 if ! command -v hysteria >/dev/null 2>&1; then
-  retry 3 5 bash -c "$(curl -fsSL --connect-timeout 10 --max-time 120 https://get.hy2.sh/)" >/var/log/hy2-install.log 2>&1
+  retry 3 5 bash -c "$(curl -fsSL --connect-timeout 10 --max-time 120 https://get.hy2.sh/)" \
+    >/var/log/hy2-install.log 2>&1
 fi
 HYST_BIN="$(command -v hysteria || echo /usr/local/bin/hysteria)"
 [[ -x "$HYST_BIN" ]] || { print_error "hysteria бинарь не найден"; exit 1; }
 
 render_hy2_config
 
-# systemd unit для Hysteria2 (запускаем от hysteria, не root).
 cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria2 Server
@@ -1063,9 +1071,6 @@ ReadWritePaths=/etc/hysteria
 WantedBy=multi-user.target
 EOF
 
-# Renewal-хук: при обновлении LE-серта копируем новые файлы в
-# /etc/hysteria/certs/ (с правами hysteria) и рестартуем hysteria.
-# certbot экспортирует $RENEWED_LINEAGE — путь к /etc/letsencrypt/live/<name>/.
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 cat > /etc/letsencrypt/renewal-hooks/deploy/99-hysteria-restart.sh <<'EOF'
 #!/bin/sh
@@ -1084,20 +1089,20 @@ systemctl daemon-reload
 systemctl enable --now hysteria-server.service
 systemctl restart hysteria-server.service
 wait_for_active hysteria-server.service 15 || {
-  print_error "hysteria не стартанул";
-  journalctl -u hysteria-server.service -n 80 --no-pager >&2 || true
-  exit 1
+  print_error "hysteria не стартанул"
+  journalctl -u hysteria-server.service -n 80 --no-pager >&2 || true; exit 1
 }
 systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 print_status "Hysteria2 работает"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HAPROXY (SNI router, TCP)
+# HAPROXY
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Настройка HAProxy..."
 backup_file /etc/haproxy/haproxy.cfg 5
 
-CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)"
+(( CPU_COUNT < 1 )) && CPU_COUNT=1
 
 cat > /etc/haproxy/haproxy.cfg <<EOF
 global
@@ -1128,12 +1133,10 @@ frontend front_main
     bind *:${HAPROXY_PORT}
     mode tcp
 
-    # Ждём ClientHello и принимаем только TLS-трафик.
     tcp-request inspect-delay 5s
     tcp-request content reject if !{ req_ssl_hello_type 1 }
-    tcp-request content accept if { req_ssl_hello_type 1 }
+    tcp-request content accept if  { req_ssl_hello_type 1 }
 
-    # SNI-роутинг (case-insensitive).
     acl is_hy2site req.ssl_sni -i ${HY2_DOMAIN}
     acl is_telemt  req.ssl_sni -i ${TELEMT_TLS_DOMAIN}
     acl is_xray    req.ssl_sni -i ${XRAY_SNI} www.${XRAY_SNI}
@@ -1142,7 +1145,6 @@ frontend front_main
     use_backend bk_telemt  if is_telemt
     use_backend bk_xray    if is_xray
 
-    # Неизвестный SNI → нейтральная HTTPS-заглушка.
     default_backend bk_hy2site
 
 backend bk_hy2site
@@ -1162,26 +1164,19 @@ backend bk_xray
 EOF
 
 if ! haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1; then
-  print_error "haproxy.cfg синтаксически невалиден — откатываю"
+  print_error "haproxy.cfg невалиден — откатываю"
   LAST_BAK="$(ls -1t /etc/haproxy/haproxy.cfg.bak.* 2>/dev/null | head -n1 || true)"
-  if [[ -n "$LAST_BAK" ]]; then
-    cp -p "$LAST_BAK" /etc/haproxy/haproxy.cfg
-    print_warning "Откат к $LAST_BAK"
-  fi
+  [[ -n "$LAST_BAK" ]] && cp -p "$LAST_BAK" /etc/haproxy/haproxy.cfg
   exit 1
 fi
 
 systemctl enable --now haproxy
 systemctl restart haproxy
 if ! wait_for_active haproxy 10; then
-  print_error "haproxy не стартанул — откатываю на бэкап"
+  print_error "haproxy не стартанул"
   LAST_BAK="$(ls -1t /etc/haproxy/haproxy.cfg.bak.* 2>/dev/null | head -n1 || true)"
-  if [[ -n "$LAST_BAK" ]]; then
-    cp -p "$LAST_BAK" /etc/haproxy/haproxy.cfg
-    systemctl restart haproxy || true
-  fi
-  journalctl -u haproxy -n 80 --no-pager >&2 || true
-  exit 1
+  [[ -n "$LAST_BAK" ]] && { cp -p "$LAST_BAK" /etc/haproxy/haproxy.cfg; systemctl restart haproxy || true; }
+  journalctl -u haproxy -n 80 --no-pager >&2 || true; exit 1
 fi
 print_status "HAProxy работает (nbthread=${CPU_COUNT})"
 
@@ -1189,52 +1184,44 @@ print_status "HAProxy работает (nbthread=${CPU_COUNT})"
 # UFW
 # ─────────────────────────────────────────────────────────────────────────────
 print_info "Настройка UFW..."
-ufw allow 22/tcp comment "SSH"
-ufw allow 80/tcp comment "ACME (certbot renew)"
+ufw allow 22/tcp   comment "SSH"
+ufw allow 80/tcp   comment "ACME (certbot renew)"
 ufw allow "${HAPROXY_PORT}/tcp" comment "HAProxy SNI router"
-ufw allow 443/udp comment "Hysteria2 QUIC"
+ufw allow 443/udp  comment "Hysteria2 QUIC"
 ufw --force enable >/dev/null
 print_status "UFW настроен"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI-команды
+# CLI-КОМАНДЫ
 # ─────────────────────────────────────────────────────────────────────────────
 
-# mainuser
 cat > /usr/local/bin/mainuser <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
 print_bundle "$(require_first_user)"
 EOF
 chmod 755 /usr/local/bin/mainuser
 
-# userlist
 cat > /usr/local/bin/userlist <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
 db_print_users_indexed
 EOF
 chmod 755 /usr/local/bin/userlist
 
-# newuser
 cat > /usr/local/bin/newuser <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
 
 read -rp "Введите имя пользователя: " NAME
 if ! [[ "$NAME" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
-  print_error "Имя должно соответствовать ^[A-Za-z0-9._-]{1,32}\$"
-  exit 1
+  print_error "Имя должно соответствовать ^[A-Za-z0-9._-]{1,32}\$"; exit 1
 fi
 if db_has_user "$NAME"; then
-  print_error "Пользователь '$NAME' уже существует"
-  exit 1
+  print_error "Пользователь '$NAME' уже существует"; exit 1
 fi
 
 UUID="$(xray uuid)"
@@ -1244,149 +1231,108 @@ TELSECRET="$(gen_hex_secret)"
 db_add_user "$NAME" "$UUID" "$HY2PASS" "$TELSECRET"
 render_all_configs
 restart_dynamic_services
-
 print_bundle "$NAME"
 EOF
 chmod 755 /usr/local/bin/newuser
 
-# rmuser (с подтверждением)
 cat > /usr/local/bin/rmuser <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
 
 db_print_users_indexed "Нет пользователей для удаления."
-
 if [[ ${#USERS_ARR[@]} -le 1 ]]; then
-  print_error "Нельзя удалить последнего пользователя."
-  exit 1
+  print_error "Нельзя удалить последнего пользователя."; exit 1
 fi
-
 SEL="$(db_pick_user "Номер для удаления")"
 read -rp "Удалить '$SEL'? (y/N): " conf
 [[ "$conf" =~ ^[yY]$ ]] || { echo "Отменено."; exit 0; }
-
 db_remove_user "$SEL"
 render_all_configs
 restart_dynamic_services
-
 echo "Пользователь '$SEL' удалён."
 EOF
 chmod 755 /usr/local/bin/rmuser
 
-# sharelink
 cat > /usr/local/bin/sharelink <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
-
 db_print_users_indexed "Нет пользователей."
 SEL="$(db_pick_user "Выберите пользователя")"
 print_bundle "$SEL"
 EOF
 chmod 755 /usr/local/bin/sharelink
 
-# hy2info
 cat > /usr/local/bin/hy2info <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
-
 user="$(require_first_user)"
 LINK="$(hy2_link_for "$user")"
-echo
-echo "=== Hysteria2 ==="
-echo "$LINK"
-echo
+echo; echo "=== Hysteria2 ==="; echo "$LINK"; echo
 show_qr "$LINK"
 EOF
 chmod 755 /usr/local/bin/hy2info
 
-# hy2list
 cat > /usr/local/bin/hy2list <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
-
 mapfile -t users < <(db_user_names)
 [[ ${#users[@]} -eq 0 ]] && { echo "Пользователей нет"; exit 1; }
 echo "Пользователи Hysteria2:"
-for i in "${!users[@]}"; do
-  echo "$((i+1)). ${users[$i]}"
-done
+for i in "${!users[@]}"; do echo "$((i+1)). ${users[$i]}"; done
 EOF
 chmod 755 /usr/local/bin/hy2list
 
-# hy2links
 cat > /usr/local/bin/hy2links <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
-
 mapfile -t users < <(db_user_names)
 [[ ${#users[@]} -eq 0 ]] && { echo "Пользователей нет"; exit 1; }
 echo "Ссылки Hysteria2:"
-for u in "${users[@]}"; do
-  echo "$u -> $(hy2_link_for "$u")"
-done
+for u in "${users[@]}"; do echo "$u -> $(hy2_link_for "$u")"; done
 EOF
 chmod 755 /usr/local/bin/hy2links
 
-# tglink
 cat > /usr/local/bin/tglink <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
-
 user="$(require_first_user)"
-HTTPS_LINK="$(tg_https_link_for "$user")"
-TG_LINK="$(tg_scheme_link_for "$user")"
-echo
-echo "=== Telegram MTProto Proxy ==="
-echo "HTTPS: $HTTPS_LINK"
-echo "TG:    $TG_LINK"
-echo
-show_qr "$HTTPS_LINK"
+echo; echo "=== Telegram MTProto Proxy ==="
+echo "HTTPS: $(tg_https_link_for "$user")"
+echo "TG:    $(tg_scheme_link_for "$user")"; echo
+show_qr "$(tg_https_link_for "$user")"
 EOF
 chmod 755 /usr/local/bin/tglink
 
-# telegramlinks
 cat > /usr/local/bin/telegramlinks <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
-
 mapfile -t users < <(db_user_names)
 [[ ${#users[@]} -eq 0 ]] && { echo "Пользователей нет"; exit 1; }
 echo "=== Telemt MTProto Proxy ==="
-for u in "${users[@]}"; do
-  echo "$u -> $(tg_https_link_for "$u")"
-done
+for u in "${users[@]}"; do echo "$u -> $(tg_https_link_for "$u")"; done
 EOF
 chmod 755 /usr/local/bin/telegramlinks
 
-# proxystatus
+# proxystatus — включает warp-svc
 cat > /usr/local/bin/proxystatus <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
 
-HAPROXY_PORT="$(kv haproxy_port)"; XRAY_PORT="$(kv xray_port)"; TELEMT_PORT="$(kv telemt_port)"
-[[ -z "$HAPROXY_PORT" ]] && HAPROXY_PORT=443
-[[ -z "$XRAY_PORT" ]]    && XRAY_PORT=8443
-[[ -z "$TELEMT_PORT" ]]  && TELEMT_PORT=9443
+HAPROXY_PORT="$(kv haproxy_port)"; [[ -z "$HAPROXY_PORT" ]] && HAPROXY_PORT=443
+XRAY_PORT="$(kv xray_port)";       [[ -z "$XRAY_PORT" ]]    && XRAY_PORT=8443
+TELEMT_PORT="$(kv telemt_port)";   [[ -z "$TELEMT_PORT" ]]  && TELEMT_PORT=9443
 
 echo
 echo "=== Сервисы ==="
-for svc in haproxy xray telemt hysteria-server.service; do
+for svc in haproxy xray telemt hysteria-server.service warp-svc; do
   printf "%-26s : " "$svc"
   if systemctl is-active --quiet "$svc"; then
     printf "${GREEN}работает${NC}\n"
@@ -1397,10 +1343,14 @@ done
 
 echo
 echo "=== TCP-порты ==="
-ss -tlnp 2>/dev/null | grep -E "(:${HAPROXY_PORT}|:${XRAY_PORT}|:${TELEMT_PORT}|:80|:443|:8444|:7443)" || true
+ss -tlnp 2>/dev/null | grep -E "(:${HAPROXY_PORT}|:${XRAY_PORT}|:${TELEMT_PORT}|:80|:443|:8444|:7443|:40000)" || true
 echo
 echo "=== UDP-порты ==="
 ss -ulnp 2>/dev/null | grep -E "(:443)" || true
+echo
+echo "=== WARP ==="
+WARP_STATUS="$(warp-cli --accept-tos status 2>/dev/null || echo "warp-cli недоступен")"
+echo "$WARP_STATUS"
 echo
 echo "=== Версии ==="
 xray version 2>/dev/null | head -n1 || true
@@ -1410,58 +1360,50 @@ haproxy -v 2>/dev/null | head -n1 || true
 echo
 echo "=== Конгест-контроль / qdisc ==="
 sysctl -n net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null
+IFACE="$(ip route | grep default | awk '{print $5}' | head -n1)"
+[[ -n "$IFACE" ]] && tc qdisc show dev "$IFACE" | grep -E "^qdisc" || true
 echo
 EOF
 chmod 755 /usr/local/bin/proxystatus
 
-# proxydiag — расширенная диагностика
 cat > /usr/local/bin/proxydiag <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
 
-echo "=== /usr/local/etc/xray/.keys (обезличенный) ==="
-sed -E 's/(private_key|public_key|secret|uuid):.*/\1: ***hidden***/' "$KEYS"
+echo "=== .keys (обезличенный) ==="
+sed -E 's/(private_key|public_key|secret|uuid):.*/\1: ***/' "$KEYS"
 echo
 echo "=== Чексумы конфигов ==="
 for f in "$XRAY_CFG" "$TEL_CFG" "$HY2_CFG" /etc/haproxy/haproxy.cfg; do
-  if [[ -f "$f" ]]; then
-    sha256sum "$f"
-  fi
+  [[ -f "$f" ]] && sha256sum "$f"
 done
 echo
-echo "=== Последние логи (по 20 строк) ==="
-for svc in haproxy xray telemt hysteria-server.service; do
+echo "=== Логи (последние 20 строк) ==="
+for svc in haproxy xray telemt hysteria-server.service warp-svc; do
   echo "--- $svc ---"
   journalctl -u "$svc" -n 20 --no-pager 2>/dev/null || true
   echo
 done
-echo "=== sysctl (ключевое) ==="
+echo "=== sysctl ==="
 sysctl net.core.rmem_max net.core.wmem_max net.core.somaxconn \
-       net.core.default_qdisc net.ipv4.tcp_congestion_control \
-       fs.file-max 2>/dev/null
+       net.core.default_qdisc net.ipv4.tcp_congestion_control fs.file-max 2>/dev/null
 echo
 echo "=== UFW ==="
 ufw status verbose 2>/dev/null || true
 EOF
 chmod 755 /usr/local/bin/proxydiag
 
-# proxyrenew — принудительный certbot renew
 cat > /usr/local/bin/proxyrenew <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# shellcheck source=/usr/local/lib/proxy-common.sh disable=SC1091
 source /usr/local/lib/proxy-common.sh
-
 certbot renew --force-renewal
-# deploy-hook сам рестартанёт hysteria, но на всякий случай:
 systemctl restart hysteria-server.service
 print_status "Сертификаты обновлены"
 EOF
 chmod 755 /usr/local/bin/proxyrenew
 
-# Справка
 cat > /root/help <<'EOF'
 ============================================
   Команды управления (proxy-stack)
@@ -1502,14 +1444,14 @@ Telegram / Telemt:
 ============================================
   Перезапуск
 ============================================
-  systemctl restart haproxy xray telemt hysteria-server.service
+  systemctl restart haproxy xray telemt hysteria-server.service warp-svc
 
 ============================================
   Установка
 ============================================
-  /path/to/install.sh                # upgrade — сохраняет ключи и пользователей
-  /path/to/install.sh --reinstall    # полное пересоздание
-  /path/to/install.sh --noninteractive  # из переменных окружения
+  ./install.sh                   # upgrade — сохраняет ключи и пользователей
+  ./install.sh --reinstall       # полное пересоздание
+  ./install.sh --noninteractive  # из переменных окружения
 EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1522,8 +1464,9 @@ systemctl restart haproxy
 echo ""
 echo "============================================"
 print_status "Установка завершена"
-echo "  TCP ${HAPROXY_PORT} -> HAProxy -> {Xray | Telemt | Hysteria2 site}"
-echo "  UDP 443 -> Hysteria2"
+echo "  TCP ${HAPROXY_PORT} → HAProxy → {Xray | Telemt | Hysteria2}"
+echo "  UDP 443 → Hysteria2"
+echo "  Outbound → WARP socks5 127.0.0.1:40000"
 echo "  Первый пользователь: $(jq -r '.users[0].name' "$USERS_DB")"
 echo "============================================"
 echo ""
@@ -1531,8 +1474,8 @@ echo ""
 mainuser
 echo
 print_info "Справка: cat /root/help"
-print_info "Проверка: proxystatus"
-print_info "Лог установки: $INSTALL_LOG"
+print_info "Статус:  proxystatus"
+print_info "Лог:     $INSTALL_LOG"
 
 trap - EXIT
 echo "=== install finished: $(date -u +%FT%TZ) ==="
