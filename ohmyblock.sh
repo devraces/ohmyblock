@@ -13,12 +13,12 @@
 # Идемпотентность: повторный запуск БЕЗ --reinstall сохраняет ключи Reality
 # и базу пользователей. С --reinstall — пересоздаёт всё с нуля.
 #
-# Изменения v2 (по сравнению с оригиналом):
+# Изменения:
 #   • Cloudflare WARP установка и настройка (socks5 на 127.0.0.1:40000)
 #   • Xray/Telemt outbound через WARP
 #   • bufferSize убран из policy (был 4, вызывал деградацию скорости)
 #   • fq qdisc закрепляется при перезагрузке через networkd-dispatcher
-#   • nbthread в HAProxy = числу CPU (было жёстко 1)
+#   • nbthread в HAProxy = числу CPU
 #   • tcp-request content reject для не-TLS трафика
 #
 # Автор: Alexdev
