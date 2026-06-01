@@ -251,7 +251,7 @@ journalctl -u warp-svc -f
 /etc/hysteria/certs/{fullchain,privkey}.pem # копия LE-сертификата для hysteria
 /etc/sysctl.d/99-proxy-stack.conf           # сетевой тюнинг
 /etc/letsencrypt/live/<domain>/             # оригинальный LE-сертификат
-/var/www/masq/index.html                    # страница-заглушка masquerade
+/etc/hysteria/masq/index.html               # страница-заглушка masquerade
 /var/log/proxy-install.log                  # лог установки
 ```
 
@@ -279,7 +279,7 @@ journalctl -u warp-svc -f
 | `/etc/hysteria/certs/` | 750 | root:hysteria |
 | `/etc/hysteria/certs/fullchain.pem` | 644 | hysteria:hysteria |
 | `/etc/hysteria/certs/privkey.pem` | 600 | hysteria:hysteria |
-| `/var/www/masq/` | 755 | hysteria:hysteria |
+| `/etc/hysteria/masq/` | 755 | hysteria:hysteria |
 
 ---
 
@@ -548,7 +548,7 @@ rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
 
 # Конфиги, ключи, пользователи
 rm -rf /usr/local/etc/xray /usr/local/etc/proxy
-rm -rf /etc/telemt /etc/hysteria /var/www/masq
+rm -rf /etc/telemt /etc/hysteria
 rm -f /etc/sysctl.d/99-proxy-stack.conf
 rm -f /etc/letsencrypt/renewal-hooks/deploy/99-hysteria-restart.sh
 
