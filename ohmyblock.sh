@@ -359,7 +359,13 @@ if ! command -v warp-cli >/dev/null 2>&1; then
     https://pkg.cloudflareclient.com/pubkey.gpg \
     | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
 
-  DISTRO_CODENAME="$(lsb_release -cs 2>/dev/null || . /etc/os-release && echo "$VERSION_CODENAME")"
+  DISTRO_CODENAME="$(lsb_release -cs 2>/dev/null || true)"
+  if [[ -z "$DISTRO_CODENAME" ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    DISTRO_CODENAME="${VERSION_CODENAME:-}"
+  fi
+  [[ -n "$DISTRO_CODENAME" ]] || { print_error "Не удалось определить codename дистрибутива"; exit 1; }
   echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ ${DISTRO_CODENAME} main" \
     > /etc/apt/sources.list.d/cloudflare-client.list
 
@@ -379,7 +385,7 @@ wait_for_active warp-svc 20 || {
 
 # Регистрация (только если нет)
 WARP_STATUS="$(warp-cli --accept-tos status 2>/dev/null || echo "unknown")"
-if echo "$WARP_STATUS" | grep -qiE "registered|connected|Unable to connect"; then
+if echo "$WARP_STATUS" | grep -qiE "registered|connected"; then
   print_status "WARP уже зарегистрирован"
 else
   print_info "Регистрация WARP..."
@@ -403,8 +409,9 @@ for i in $(seq 1 15); do
 done
 
 if ! ss -tlnp | grep -q ':40000'; then
-  print_warning "WARP socks5 :40000 не слушает — возможно требуется ручная настройка"
-  print_warning "После установки выполни: warp-cli --accept-tos mode proxy && warp-cli --accept-tos connect"
+  print_error "WARP socks5 :40000 не слушает — Xray и Telemt не смогут работать через WARP"
+  print_error "Проверь: warp-cli --accept-tos mode proxy && warp-cli --accept-tos connect"
+  exit 1
 else
   print_status "WARP socks5 слушает на 127.0.0.1:40000"
   # Проверить IP
@@ -422,12 +429,12 @@ fi
 # ДИРЕКТОРИИ
 # ─────────────────────────────────────────────────────────────────────────────
 mkdir -p /usr/local/etc/xray /usr/local/etc/proxy /etc/telemt /etc/hysteria \
-         /etc/hysteria/certs /opt/telemt /var/www/masq /usr/local/lib /var/lock
+         /etc/hysteria/certs /etc/hysteria/masq /opt/telemt /usr/local/lib /var/lock
 chmod 755 /usr/local /usr/local/etc 2>/dev/null || true
 chmod 700 /usr/local/etc/proxy
 chmod 750 /usr/local/etc/xray
 chmod 750 /etc/telemt /etc/hysteria /etc/hysteria/certs
-chmod 755 /var/www/masq
+chmod 755 /etc/hysteria/masq
 
 backup_file "$KEYS" 5
 backup_file "$USERS_DB" 5
@@ -1449,9 +1456,9 @@ Telegram / Telemt:
 ============================================
   Установка
 ============================================
-  ./install.sh                   # upgrade — сохраняет ключи и пользователей
-  ./install.sh --reinstall       # полное пересоздание
-  ./install.sh --noninteractive  # из переменных окружения
+  ./ohmyblock.sh                 # upgrade — сохраняет ключи и пользователей
+  ./ohmyblock.sh --reinstall     # полное пересоздание
+  ./ohmyblock.sh --noninteractive # из переменных окружения
 EOF
 
 # ─────────────────────────────────────────────────────────────────────────────
