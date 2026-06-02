@@ -31,28 +31,7 @@
 ---
 
 ## Архитектура
-
-```
-                              ┌─────────────────────────────────────────────┐
-   Клиент (TCP 443)           │                    VPS                      │
-   ─────────────────►         │                                             │
-                              │   HAProxy :443/tcp                          │
-                              │   ├─ SNI=$XRAY_SNI ──────────┼──► Xray   :8443/tcp (loopback)  ─┐
-                              │   ├─ SNI=$TELEMT_TLS_DOMAIN ─┼──► Telemt :9443/tcp (loopback)  ─┤
-                              │   └─ SNI=$HY2_DOMAIN / def. ─┼──► Hysteria2 masq. :8444/tcp     │
-                              │                               │             │                   │
-   Клиент (UDP 443) ─────────►│   Hysteria2 :443/udp          │             │                   │
-                              │                               │             │                   │
-                              │                               │   WARP socks5 :40000  ◄──────────┘
-                              │                               │        │                        │
-                              └───────────────────────────────┼────────┼────────────────────────┘
-                                                              │        ▼
-                                                              │  Cloudflare WARP (WireGuard)
-                                                              │        │
-                                                              │        ▼
-                                                              │    Интернет
-                                                              │  (с Cloudflare IP)
-```
+![OhMyBlock](https://ik.imagekit.io/gh4fm25seyo/system_desing_-uySBz0me.webp)
 
 ### Как это работает
 
